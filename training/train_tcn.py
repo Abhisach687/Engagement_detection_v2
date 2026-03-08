@@ -154,6 +154,8 @@ def train_tcn(
 
     history = {"train_loss": [], "val_loss": [], "val_acc": []}
     best_acc = 0.0
+    bad_epochs = 0
+    patience = 3
     best_path = MODEL_DIR / "mobilenetv2_tcn.pt"
 
     epoch_bar = tqdm(range(epochs), desc="[tcn] epochs", position=0)
@@ -214,10 +216,16 @@ def train_tcn(
         epoch_bar.set_postfix(train_loss=f"{train_loss:.4f}", val_acc=f"{val_acc:.4f}", best=f"{best_acc:.4f}")
         print(f"[tcn] epoch={epoch+1}/{epochs} train_loss={train_loss:.4f} val_acc={val_acc:.4f} best={best_acc:.4f}")
 
-        if val_acc > best_acc:
+        if val_acc > best_acc + 1e-4:
             best_acc = val_acc
+            bad_epochs = 0
             torch.save(model.state_dict(), best_path)
-            print(f"[tcn] Epoch {epoch}: new best acc {best_acc:.4f}")
+            print(f"[tcn] Epoch {epoch+1}: new best acc {best_acc:.4f}")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                print(f"[tcn] Early stopping after {epoch+1} epochs (no improvement for {patience} epochs).")
+                break
 
     metrics_out = MODEL_DIR / "mobilenetv2_tcn_metrics.json"
     with open(metrics_out, "w") as f:

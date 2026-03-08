@@ -83,11 +83,24 @@ class TQDMBoosterCallback(xgb.callback.TrainingCallback):
         return None
 
 
-def _fit_with_progress(model: xgb.XGBClassifier, X_train, y_train, cb: TQDMBoosterCallback):
-    """Fit model with callbacks when supported; degrade gracefully otherwise."""
+def _fit_with_progress(
+    model: xgb.XGBClassifier,
+    X_train,
+    y_train,
+    cb: TQDMBoosterCallback,
+    eval_set=None,
+    early_stopping_rounds: int = None,
+):
+    """Fit model with callbacks and optional early stopping; degrade gracefully otherwise."""
+    fit_kwargs = {"verbose": False}
+    if eval_set is not None:
+        fit_kwargs["eval_set"] = eval_set
+        fit_kwargs["eval_metric"] = "mlogloss"
+        if early_stopping_rounds:
+            fit_kwargs["early_stopping_rounds"] = early_stopping_rounds
     if HAS_FIT_CALLBACKS:
         try:
-            model.fit(X_train, y_train, verbose=False, callbacks=[cb])
+            model.fit(X_train, y_train, callbacks=[cb], **fit_kwargs)
             return
         except TypeError:
             # Older xgboost despite signature mismatch; fall back
@@ -95,12 +108,19 @@ def _fit_with_progress(model: xgb.XGBClassifier, X_train, y_train, cb: TQDMBoost
     # Fallback: no per-round progress, but ensure training runs
     if cb:
         cb.before_training(model)
-    model.fit(X_train, y_train, verbose=False)
+    model.fit(X_train, y_train, **fit_kwargs)
     if cb:
         cb.after_training(model)
 
 
-def _fit_with_gpu_fallback(params: dict, X_train, y_train, desc: str):
+def _fit_with_gpu_fallback(
+    params: dict,
+    X_train,
+    y_train,
+    desc: str,
+    eval_set=None,
+    early_stopping_rounds: int = None,
+):
     """
     Try GPU params first; if unsupported (ValueError mentioning gpu_hist),
     fall back to CPU-friendly params. If GPU is known to be unavailable (env
@@ -112,13 +132,27 @@ def _fit_with_gpu_fallback(params: dict, X_train, y_train, desc: str):
         # Already CPU params
         model = xgb.XGBClassifier(**params_gpu)
         cb = TQDMBoosterCallback(total_rounds=params_gpu["n_estimators"], desc=desc + " [cpu]")
-        _fit_with_progress(model, X_train, y_train, cb)
+        _fit_with_progress(
+            model,
+            X_train,
+            y_train,
+            cb,
+            eval_set=eval_set,
+            early_stopping_rounds=early_stopping_rounds,
+        )
         return model, params_gpu, "cpu"
 
     model = xgb.XGBClassifier(**params_gpu)
     cb = TQDMBoosterCallback(total_rounds=params_gpu["n_estimators"], desc=desc)
     try:
-        _fit_with_progress(model, X_train, y_train, cb)
+        _fit_with_progress(
+            model,
+            X_train,
+            y_train,
+            cb,
+            eval_set=eval_set,
+            early_stopping_rounds=early_stopping_rounds,
+        )
         return model, params_gpu, "gpu"
     except ValueError as e:
         if "gpu_hist" not in str(e):
@@ -128,7 +162,14 @@ def _fit_with_gpu_fallback(params: dict, X_train, y_train, desc: str):
         print(f"[xgb] GPU unsupported in this xgboost build; falling back to CPU hist. ({e})")
         model = xgb.XGBClassifier(**params_cpu)
         cb = TQDMBoosterCallback(total_rounds=params_cpu["n_estimators"], desc=desc + " [cpu]")
-        _fit_with_progress(model, X_train, y_train, cb)
+        _fit_with_progress(
+            model,
+            X_train,
+            y_train,
+            cb,
+            eval_set=eval_set,
+            early_stopping_rounds=early_stopping_rounds,
+        )
         return model, params_cpu, "cpu"
 
 
@@ -253,7 +294,12 @@ def objective(trial: optuna.Trial, prepared: Dict[str, np.ndarray] = None, total
         params.update(XGB_GPU_PARAMS)
 
         model, used_params, device_used = _fit_with_gpu_fallback(
-            params, X_train, y_train, desc=f"[xgb] trial {trial.number + 1}/{total_trials or '?'}"
+            params,
+            X_train,
+            y_train,
+            desc=f"[xgb] trial {trial.number + 1}/{total_trials or '?'}",
+            eval_set=[(X_val, y_val)],
+            early_stopping_rounds=5,
         )
         trial.set_user_attr("xgb_device", device_used)
 
@@ -327,7 +373,12 @@ def train_best_from_study(study: optuna.Study, cache_mode: str = "prefer"):
     )
     best_params.update(XGB_GPU_PARAMS)
     model, best_params, device_used = _fit_with_gpu_fallback(
-        best_params, X_train, y_train, desc="[xgb] final train"
+        best_params,
+        X_train,
+        y_train,
+        desc="[xgb] final train",
+        eval_set=[(X_val, y_val)],
+        early_stopping_rounds=5,
     )
 
     preds = model.predict(X_val)

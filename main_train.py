@@ -26,7 +26,7 @@ def run_lstm(model_type: str, resume: bool = True, cache_mode: str = "prefer", f
 
     study = run_study(
         model_type=model_type,
-        n_trials=20,
+        n_trials=8,
         study_path=MODEL_DIR / f"{model_type}_study.db",
         resume=resume,
         cache_mode=cache_mode,

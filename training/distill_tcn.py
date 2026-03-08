@@ -212,6 +212,10 @@ def _distill_single(
         return None
 
     epoch_bar = tqdm(range(epochs), desc=f"[distill] a={alpha} T={temperature} epochs", position=0)
+    best_acc = -1.0
+    bad_epochs = 0
+    patience = 3
+    best_state = None
     for epoch in epoch_bar:
         rerun_epoch = True
         while rerun_epoch:
@@ -289,7 +293,19 @@ def _distill_single(
         )
         print(f"[alpha={alpha},T={temperature}] epoch={epoch+1}/{epochs} distill_loss={avg_loss:.4f} val_acc={val_acc:.4f}")
 
+        if val_acc > best_acc + 1e-4:
+            best_acc = val_acc
+            bad_epochs = 0
+            best_state = {k: v.cpu() for k, v in student.state_dict().items()}
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                print(f"[distill] Early stopping after {epoch+1} epochs (no improvement for {patience} epochs).")
+                break
+
     # Validation accuracy for model selection
+    if best_state is not None:
+        student.load_state_dict(best_state)
     val_acc = _eval(student, val_loader, device, progress_desc="[distill] final val")
 
     torch.save(student.state_dict(), output_path)
@@ -322,6 +338,8 @@ def distill(
     search: bool = False,
     cache_mode: str = "prefer",
 ):
+    # Cap distillation to 8 epochs to keep runs consistent with other models.
+    epochs = min(EPOCHS, 8)
     candidates = [(alpha, temperature)]
     if search:
         candidates = [(a, t) for a in (0.3, 0.5, 0.7) for t in (2.0, 4.0, 6.0)]
@@ -334,7 +352,7 @@ def distill(
             temperature=t,
             batch_size=batch_size,
             lr=lr,
-            epochs=EPOCHS,
+            epochs=epochs,
             cache_path=cache_path,
             output_path=trial_path,
             cache_mode=cache_mode,

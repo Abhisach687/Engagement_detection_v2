@@ -9,6 +9,7 @@ Complete DAiSEE engagement pipeline: HOG+XGBoost baseline, MobileNetV2 + LSTM/Bi
    .\.venv\Scripts\Activate.ps1
    pip install --upgrade pip
    pip install -r requirements.txt
+   $env:REQUIRE_CUDA = "1" (To enable GPU based training via cuda)
    ```
 2. Place DAiSEE data:
    ```

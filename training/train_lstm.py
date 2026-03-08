@@ -1,5 +1,10 @@
 import json
 import os
+
+# Set allocator BEFORE importing torch to avoid runtime/load-time mismatches on Windows.
+# Using native allocator for stability.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:native")
+
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Tuple
@@ -13,6 +18,7 @@ from sklearn.model_selection import train_test_split
 from torch import amp
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
+
 
 from config import (
     FRAMES_DIR,
@@ -329,6 +335,8 @@ def train_best_from_study(model_type: str, study: optuna.Study, cache_mode: str 
 
     history = {"train_loss": [], "val_loss": [], "val_acc": []}
     best_acc = 0.0
+    bad_epochs = 0
+    patience = 3
     best_path = MODEL_DIR / f"mobilenetv2_{model_type}.pt"
 
     epoch_bar = tqdm(range(EPOCHS), desc=f"[{model_type}] finetune epochs", position=0)
@@ -397,10 +405,16 @@ def train_best_from_study(model_type: str, study: optuna.Study, cache_mode: str 
             f"train_loss={train_loss:.4f} val_acc={val_acc:.4f} best={best_acc:.4f}"
         )
 
-        if val_acc > best_acc:
+        if val_acc > best_acc + 1e-4:
             best_acc = val_acc
+            bad_epochs = 0
             torch.save(model.state_dict(), best_path)
-            print(f"[{model_type}] Epoch {epoch}: new best acc {best_acc:.4f}")
+            print(f"[{model_type}] Epoch {epoch+1}: new best acc {best_acc:.4f}")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                print(f"[{model_type}] Early stopping after {epoch+1} epochs (no improvement for {patience} epochs).")
+                break
 
     metrics_out = MODEL_DIR / f"mobilenetv2_{model_type}_metrics.json"
     with open(metrics_out, "w") as f:
@@ -413,5 +427,5 @@ def train_best_from_study(model_type: str, study: optuna.Study, cache_mode: str 
 if __name__ == "__main__":
     # Train both models by default
     for model_type in ["lstm", "bilstm"]:
-        study = run_study(model_type=model_type, n_trials=20, study_path=MODEL_DIR / f"{model_type}_study.db")
+        study = run_study(model_type=model_type, n_trials=8, study_path=MODEL_DIR / f"{model_type}_study.db")
         train_best_from_study(model_type, study)
