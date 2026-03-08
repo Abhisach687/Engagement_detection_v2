@@ -1,0 +1,46 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python cache/artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Model artifacts and caches
+models/*.pt
+models/*.ts
+models/*_study.db
+models/xgb_hog.json
+models/xgb_hog_scaler.joblib
+models/*_metrics.json
+models/hog_features/
+cache/
+
+# Data (not tracked)
+DAiSEE/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Build/dist
+dist/
+build/
+
+# OS
+Thumbs.db
+.DS_Store
