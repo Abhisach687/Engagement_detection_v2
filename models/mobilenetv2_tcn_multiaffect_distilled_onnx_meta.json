@@ -1,0 +1,17 @@
+{
+  "variant": "multiaffect",
+  "stem": "mobilenetv2_tcn_multiaffect_distilled",
+  "num_heads": 4,
+  "head_names": [
+    "Engagement",
+    "Boredom",
+    "Confusion",
+    "Frustration"
+  ],
+  "num_classes": 4,
+  "seq_len": 30,
+  "img_size": 224,
+  "source_path": "C:\\Users\\Lenovo\\Documents\\Engagement Detection Project\\models\\mobilenetv2_tcn_multiaffect_distilled.ts",
+  "input_name": "frames",
+  "output_name": "logits"
+}

@@ -40,7 +40,7 @@ def run_tcn(cache_mode: str = "prefer"):
     train_tcn(epochs=TCN_EPOCHS, batch_size=TCN_BATCH_SIZE, cache_mode=cache_mode)
 
 
-def run_distill(alpha: float, temperature: float, cache_mode: str = "prefer", force: bool = False):
+def run_distill(alpha: float | None, temperature: float | None, cache_mode: str = "prefer", force: bool = False):
     from training.distill_tcn import distill
     from pathlib import Path
 
@@ -50,23 +50,52 @@ def run_distill(alpha: float, temperature: float, cache_mode: str = "prefer", fo
         return
 
     distill(
-        alpha=alpha,
-        temperature=temperature,
+        alpha=0.5 if alpha is None else alpha,
+        temperature=4.0 if temperature is None else temperature,
         batch_size=DISTILL_BATCH_SIZE,
         epochs=DISTILL_EPOCHS,
         cache_mode=cache_mode,
     )
 
 
+def run_multiaffect(task: str, alpha: float | None, temperature: float | None, cache_mode: str = "prefer"):
+    from training.train_multiaffect import distill_multiaffect, run_all, train_multiaffect_teacher
+
+    if task == "lstm_multi":
+        train_multiaffect_teacher("lstm", cache_mode=cache_mode)
+    elif task == "bilstm_multi":
+        train_multiaffect_teacher("bilstm", cache_mode=cache_mode)
+    elif task == "teachers_multi":
+        train_multiaffect_teacher("lstm", cache_mode=cache_mode)
+        train_multiaffect_teacher("bilstm", cache_mode=cache_mode)
+    elif task == "distill_multi":
+        distill_multiaffect(alpha=alpha, temperature=temperature, cache_mode=cache_mode)
+    else:
+        run_all(alpha=alpha, temperature=temperature, cache_mode=cache_mode)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train engagement models")
     parser.add_argument(
         "task",
-        choices=["xgb", "xgboost", "lstm", "bilstm", "tcn", "distill", "all"],
+        choices=[
+            "xgb",
+            "xgboost",
+            "lstm",
+            "bilstm",
+            "tcn",
+            "distill",
+            "all",
+            "lstm_multi",
+            "bilstm_multi",
+            "teachers_multi",
+            "distill_multi",
+            "all_multi",
+        ],
         help="Which training pipeline to run (alias: xgboost -> xgb)",
     )
-    parser.add_argument("--alpha", type=float, default=0.5, help="KD loss weight (distill only)")
-    parser.add_argument("--temperature", type=float, default=4.0, help="KD temperature (distill only)")
+    parser.add_argument("--alpha", type=float, default=None, help="KD loss weight (distill only)")
+    parser.add_argument("--temperature", type=float, default=None, help="KD temperature (distill only)")
     args = parser.parse_args()
 
     if args.task in {"xgb", "xgboost"}:
@@ -75,6 +104,8 @@ if __name__ == "__main__":
         run_lstm(args.task)
     elif args.task == "tcn":
         run_tcn()
+    elif args.task in {"lstm_multi", "bilstm_multi", "teachers_multi", "distill_multi", "all_multi"}:
+        run_multiaffect(args.task, alpha=args.alpha, temperature=args.temperature)
     elif args.task == "all":
         run_xgb()
         run_lstm("lstm")

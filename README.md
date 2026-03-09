@@ -1,11 +1,11 @@
 # Engagement Detection Project
 
-Complete DAiSEE engagement pipeline: HOG + XGBoost baseline, MobileNetV2 + LSTM/BiLSTM/TCN, knowledge distillation, LMDB caching, and a NiceGUI webcam app. Project is AI-assisted (ChatGPT/Codex).
+Complete DAiSEE engagement pipeline: HOG + XGBoost baseline, MobileNetV2 + LSTM/BiLSTM/TCN, single-task and multi-affect distillation, LMDB caching, and a desktop webcam app. Project is AI-assisted (ChatGPT/Codex).
 
 ## Quick Start
-1. Create and activate a virtual environment (Python 3.10+):
+1. Create and activate a virtual environment (Python 3.11):
    ```powershell
-   py -3.10 -m venv .venv
+   python -m venv .venv
    .\.venv\Scripts\Activate.ps1
    pip install --upgrade pip
    pip install -r requirements.txt
@@ -52,6 +52,28 @@ Notes:
 - Distillation validation uses cache when present, but falls back to frame folders if Validation LMDB entries are missing.
 - Progress bars are nested as `trial -> boost/epoch -> batch -> val`.
 
+## Direct Training Commands
+Use `main_train.py` when you want a specific pipeline stage instead of the broader `trainmodels.py` wrapper.
+
+```powershell
+# full single-task pipeline
+.\.venv\Scripts\python.exe main_train.py all
+
+# full multi-affect pipeline
+.\.venv\Scripts\python.exe main_train.py all_multi
+
+# full multi-affect pipeline with explicit KD settings
+.\.venv\Scripts\python.exe main_train.py all_multi --alpha 0.48 --temperature 4.48
+
+# only distill the 4-head TCN student after the multi-affect teachers exist
+.\.venv\Scripts\python.exe main_train.py distill_multi
+```
+
+Multi-affect notes:
+- `all_multi` trains the LSTM multi-affect teacher, the BiLSTM multi-affect teacher, then the 4-head TCN student.
+- `distill_multi` now warm-starts from `models/mobilenetv2_tcn_distilled.pt` when that single-task student exists, so the shared TCN trunk does not start from scratch.
+- If you omit `--alpha` and `--temperature`, the multi-affect distillation stage reuses the current saved distilled student settings from `models/mobilenetv2_tcn_distilled_metrics.json` when available.
+
 ## Evaluate
 ```powershell
 python testmodel.py --split Validation
@@ -61,10 +83,14 @@ python evaluatemodels.py
 
 ## Inference App
 ```powershell
-python app.py
+.\.venv\Scripts\python.exe app.py
 ```
 
-The GUI shows the active device (`cuda` or `cpu`).
+App behavior:
+- The app auto-loads the multi-affect distilled student if `models/mobilenetv2_tcn_multiaffect_distilled.*` exists.
+- Otherwise it falls back to the original engagement-only distilled student.
+- If the required ONNX export is missing, the app tries to export it automatically from the saved PyTorch or TorchScript checkpoint.
+- The GUI shows the active device (`cuda` or `cpu`) and the active model variant.
 
 ## Outputs
 - Models and metrics: `models/`
@@ -73,6 +99,8 @@ The GUI shows the active device (`cuda` or `cpu`).
 - Frame LMDB: `cache/frames.lmdb`
   Keys are split-namespaced: `Train:clip`, `Validation:clip`, `Test:clip`
 - Study databases: `models/*.db`
+- Multi-affect distilled student: `models/mobilenetv2_tcn_multiaffect_distilled.pt`
+- Multi-affect distilled metrics: `models/mobilenetv2_tcn_multiaffect_distilled_metrics.json`
 
 ## Current Training Defaults
 - XGB uses version-safe GPU settings when available and falls back to CPU `hist` if unsupported.
@@ -84,6 +112,7 @@ The GUI shows the active device (`cuda` or `cpu`).
 - Distillation memoizes cached HOG teacher features in memory across epochs.
 - TCN and distillation use `torch.amp` autocast and `GradScaler`, auto-shrink batch size on CUDA OOM, then fall back to CPU if needed.
 - LSTM/BiLSTM Optuna batch search is capped at 8 trials with batch choices `4/6/8`.
+- Multi-affect distillation reuses the current single-task distilled student hyperparameters when available and warm-starts compatible student weights from the single-task TCN checkpoint.
 
 ## Tips
 - Set `XGB_FORCE_CPU=1` to skip the GPU attempt for XGBoost.

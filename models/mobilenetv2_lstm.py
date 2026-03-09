@@ -8,9 +8,11 @@ class MobileNetV2_LSTM(nn.Module):
     Single-directional LSTM on per-frame embeddings.
     """
 
-    def __init__(self, num_classes=4, hidden_size=256, num_layers=2, dropout=0.3):
+    def __init__(self, num_classes=4, hidden_size=256, num_layers=2, dropout=0.3, num_heads: int = 1):
         super().__init__()
         self.backbone = MobileNetV2Backbone()
+        self.num_classes = num_classes
+        self.num_heads = num_heads
         self.lstm = nn.LSTM(
             input_size=self.backbone.out_dim,
             hidden_size=hidden_size,
@@ -18,7 +20,7 @@ class MobileNetV2_LSTM(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.fc = nn.Linear(hidden_size, num_classes)
+        self.fc = nn.Linear(hidden_size, num_classes * num_heads)
 
     def forward(self, x):
         # x: (B, T, C, H, W)
@@ -28,4 +30,7 @@ class MobileNetV2_LSTM(nn.Module):
         feat = feat.view(b, t, -1)
         lstm_out, _ = self.lstm(feat)
         final = lstm_out[:, -1, :]
-        return self.fc(final)
+        logits = self.fc(final)
+        if self.num_heads == 1:
+            return logits
+        return logits.view(b, self.num_heads, self.num_classes)

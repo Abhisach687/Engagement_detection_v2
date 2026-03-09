@@ -9,6 +9,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from utils.affect import row_to_affect_labels
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -63,6 +65,7 @@ class VideoFrameDataset(Dataset):
         cache_path: Optional[Path] = None,
         force_cache: bool = False,
         no_cache: bool = False,
+        label_mode: str = "engagement",
     ):
         self.df = df.reset_index(drop=True)
         self.frames_dir = frames_dir
@@ -71,6 +74,7 @@ class VideoFrameDataset(Dataset):
         self.split = split
         self.force_cache = force_cache
         self.no_cache = no_cache
+        self.label_mode = label_mode
 
         # When reading from cache we skip stochastic augmentations
         use_augment = augment and (cache_path is None or no_cache)
@@ -159,18 +163,24 @@ class VideoFrameDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         clip = row["ClipID"]
+        affect_labels = row_to_affect_labels(row)
 
         cached = None if self.no_cache else self._load_from_cache(clip)
         if cached is not None:
-            frames, label = cached
+            frames, cached_label = cached
         else:
             folder = self.frames_dir / self.split / clip
             frame_paths = sorted(folder.glob("frame_*.jpg"))
             frames = load_frame_tensor(frame_paths, self.transform, self.seq_len)
-            label = int(row["Engagement"])
+            cached_label = int(row["Engagement"])
             if self.force_cache:
                 raise RuntimeError(f"Cache miss for clip {clip} in split {self.split}")
 
+        if self.label_mode == "multiaffect":
+            label = torch.tensor(affect_labels, dtype=torch.long)
+        else:
+            label = torch.tensor(cached_label, dtype=torch.long)
+
         if self.return_clip_id:
-            return frames, torch.tensor(label, dtype=torch.long), clip
-        return frames, torch.tensor(label, dtype=torch.long)
+            return frames, label, clip
+        return frames, label
