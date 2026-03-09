@@ -1,0 +1,8 @@
+{
+  "alpha": 0.5,
+  "temperature": 4.0,
+  "epochs": 8,
+  "val_accuracy": 0.5507347795661302,
+  "batch_size": 4,
+  "lr": 0.0001
+}
