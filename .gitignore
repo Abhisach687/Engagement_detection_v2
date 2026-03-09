@@ -22,6 +22,7 @@ logs/
 *.log
 
 # Model artifacts and caches
+models/*.*
 models/*.pt
 models/*.ts
 models/*_study.db
