@@ -94,6 +94,17 @@ class VideoFrameDataset(Dataset):
             print(f"[VideoFrameDataset] skipped {len(missing)} clips with no frames/cache in split={self.split}")
 
     def _has_frames_or_cache(self, clip: str) -> bool:
+        if self.force_cache:
+            env = self._ensure_cache_env()
+            if env is None:
+                return False
+            key = f"{self.split}:{clip}".encode()
+            with env.begin(write=False) as txn:
+                if txn.get(key) is not None:
+                    return True
+                # legacy fallback without split
+                return txn.get(clip.encode()) is not None
+
         folder = self.frames_dir / self.split / clip
         if any(folder.glob("frame_*.jpg")):
             return True

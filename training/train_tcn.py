@@ -1,8 +1,9 @@
 import json
 import os
+import gc
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Tuple
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,7 +26,10 @@ from config import (
     RANDOM_STATE,
     LMDB_CACHE_PATH,
     LR,
-    BATCH_SIZE,
+    TCN_BATCH_SIZE,
+    TCN_NUM_WORKERS,
+    TCN_EPOCHS,
+    TCN_MAX_EPOCHS,
 )
 from data.dataset_loader import load_labels
 from features.frame_dataset import VideoFrameDataset
@@ -54,6 +58,13 @@ def _fallback_to_cpu(model, optimizer, tag: str):
     return device
 
 
+def _cleanup_after_oom(optimizer):
+    optimizer.zero_grad(set_to_none=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _split_labels():
     df = load_labels(LABELS_DIR / "TrainLabels.csv")
     return train_test_split(df, test_size=0.2, random_state=RANDOM_STATE, stratify=df["Engagement"])
@@ -63,7 +74,7 @@ def _make_loaders(df_train, df_val, batch_size, seq_len, cache_path, device: tor
     cache = cache_path if cache_path and Path(cache_path).exists() else None
     force_cache = cache_mode == "force"
     no_cache = cache_mode == "off"
-    worker_count = min(8, os.cpu_count() or 4)
+    worker_count = min(TCN_NUM_WORKERS, os.cpu_count() or TCN_NUM_WORKERS)
     pin_mem = device.type == "cuda"
     train_ds = VideoFrameDataset(
         df_train,
@@ -88,9 +99,10 @@ def _make_loaders(df_train, df_val, batch_size, seq_len, cache_path, device: tor
         no_cache=no_cache,
     )
 
-    class_counts = df_train["Engagement"].value_counts().reindex(range(NUM_CLASSES), fill_value=0).values
+    train_df_filtered = train_ds.df  # may be pruned if frames/cache missing
+    class_counts = train_df_filtered["Engagement"].value_counts().reindex(range(NUM_CLASSES), fill_value=0).values
     weights = 1.0 / (class_counts + 1e-6)
-    sample_weights = torch.DoubleTensor([weights[int(y)] for y in df_train["Engagement"]])
+    sample_weights = torch.DoubleTensor([weights[int(y)] for y in train_df_filtered["Engagement"]])
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
     common_kwargs = {
@@ -99,11 +111,24 @@ def _make_loaders(df_train, df_val, batch_size, seq_len, cache_path, device: tor
     }
     if worker_count > 0:
         common_kwargs["persistent_workers"] = True
-        common_kwargs["prefetch_factor"] = 2
+        common_kwargs["prefetch_factor"] = 1
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, **common_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **common_kwargs)
     return train_loader, val_loader, train_ds, val_ds
+
+
+def _train_step(model, optimizer, scaler, criterion, x, y, device):
+    optimizer.zero_grad(set_to_none=True)
+    with _autocast(device):
+        logits = model(x)
+        loss = criterion(logits, y)
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+    scaler.step(optimizer)
+    scaler.update()
+    return loss.item(), y.size(0)
 
 
 def _eval(model, loader, device, progress_desc: str = None, position: int = 2):
@@ -129,14 +154,22 @@ def _eval(model, loader, device, progress_desc: str = None, position: int = 2):
 
 
 def train_tcn(
-    epochs: int = 8,
+    epochs: Optional[int] = None,
     lr: float = LR,
     weight_decay: float = 1e-4,
-    batch_size: int = BATCH_SIZE,
-    seq_len: int = SEQ_LEN,
+    batch_size: Optional[int] = None,
+    seq_len: Optional[int] = None,
     cache_path: Path = LMDB_CACHE_PATH,
     cache_mode: str = "prefer",
 ):
+    if epochs is None:
+        epochs = TCN_EPOCHS
+    epochs = min(max(1, int(epochs)), TCN_MAX_EPOCHS)
+    if batch_size is None:
+        batch_size = TCN_BATCH_SIZE
+    if seq_len is None:
+        seq_len = SEQ_LEN
+
     df_train, df_val = _split_labels()
     from config import DEVICE
 
@@ -146,8 +179,12 @@ def train_tcn(
         df_train, df_val, current_batch, seq_len, cache_path, device, cache_mode=cache_mode
     )
 
-    print(f"[train_tcn] using device: {device} | start batch_size={current_batch}")
     model = MobileNetV2_TCN(num_classes=NUM_CLASSES).to(device)
+    print(
+        "[train_tcn] using device: "
+        f"{device} | epochs={epochs} | start batch_size={current_batch} | seq_len={seq_len} "
+        f"| workers={train_loader.num_workers} | frame_chunk={model.backbone.frame_chunk_size or 'full'}"
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler = amp.GradScaler("cuda", enabled=device.type == "cuda")
     criterion = nn.CrossEntropyLoss()
@@ -174,21 +211,13 @@ def train_tcn(
                 )
                 for x, y in train_iter:
                     x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                    optimizer.zero_grad(set_to_none=True)
-                    with _autocast(device):
-                        logits = model(x)
-                        loss = criterion(logits, y)
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    total_loss += loss.item() * y.size(0)
-                    train_iter.set_postfix(loss=f"{loss.item():.4f}", bs=current_batch)
+                    loss_value, batch_items = _train_step(model, optimizer, scaler, criterion, x, y, device)
+                    total_loss += loss_value * batch_items
+                    train_iter.set_postfix(loss=f"{loss_value:.4f}", bs=current_batch)
                 rerun_epoch = False
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    torch.cuda.empty_cache()
+                    _cleanup_after_oom(optimizer)
                     if device.type == "cuda" and current_batch > 1:
                         new_bs = max(1, current_batch // 2)
                         print(f"[tcn] OOM at batch_size={current_batch}; retrying with {new_bs}")

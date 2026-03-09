@@ -1,5 +1,5 @@
 import argparse
-from config import MODEL_DIR
+from config import MODEL_DIR, TCN_BATCH_SIZE, DISTILL_BATCH_SIZE, TCN_EPOCHS, DISTILL_EPOCHS
 
 
 def run_xgb(resume: bool = True, cache_mode: str = "prefer", force: bool = False):
@@ -37,7 +37,7 @@ def run_lstm(model_type: str, resume: bool = True, cache_mode: str = "prefer", f
 def run_tcn(cache_mode: str = "prefer"):
     from training.train_tcn import train_tcn
 
-    train_tcn(cache_mode=cache_mode)
+    train_tcn(epochs=TCN_EPOCHS, batch_size=TCN_BATCH_SIZE, cache_mode=cache_mode)
 
 
 def run_distill(alpha: float, temperature: float, cache_mode: str = "prefer", force: bool = False):
@@ -49,7 +49,13 @@ def run_distill(alpha: float, temperature: float, cache_mode: str = "prefer", fo
         print(f"[distill] Found existing distilled model at {distilled_path}; skipping (use --retrain_distill to force).")
         return
 
-    distill(alpha=alpha, temperature=temperature, cache_mode=cache_mode)
+    distill(
+        alpha=alpha,
+        temperature=temperature,
+        batch_size=DISTILL_BATCH_SIZE,
+        epochs=DISTILL_EPOCHS,
+        cache_mode=cache_mode,
+    )
 
 
 if __name__ == "__main__":

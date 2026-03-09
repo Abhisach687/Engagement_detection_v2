@@ -42,6 +42,20 @@ NUM_CLASSES = 4
 
 # Training defaults (overridden by tuners)
 BATCH_SIZE = 8
+TCN_BATCH_SIZE = max(1, int(os.getenv("TCN_BATCH_SIZE", str(min(BATCH_SIZE, 4)))))
+DISTILL_BATCH_SIZE = max(1, int(os.getenv("DISTILL_BATCH_SIZE", str(TCN_BATCH_SIZE))))
+TCN_NUM_WORKERS = max(0, int(os.getenv("TCN_NUM_WORKERS", "2")))
+DISTILL_NUM_WORKERS = max(0, int(os.getenv("DISTILL_NUM_WORKERS", str(TCN_NUM_WORKERS))))
+BACKBONE_FRAME_CHUNK = max(0, int(os.getenv("BACKBONE_FRAME_CHUNK", "32")))
+TCN_MAX_EPOCHS = 8
+TCN_EPOCHS = min(max(1, int(os.getenv("TCN_EPOCHS", str(TCN_MAX_EPOCHS)))), TCN_MAX_EPOCHS)
+DISTILL_MAX_EPOCHS = 8
+DISTILL_EPOCHS = min(max(1, int(os.getenv("DISTILL_EPOCHS", str(DISTILL_MAX_EPOCHS)))), DISTILL_MAX_EPOCHS)
+DISTILL_MAX_TRIALS = 8
+DISTILL_SEARCH_TRIALS = min(
+    max(1, int(os.getenv("DISTILL_SEARCH_TRIALS", str(DISTILL_MAX_TRIALS)))),
+    DISTILL_MAX_TRIALS,
+)
 EPOCHS = 25
 LR = 1e-4
 

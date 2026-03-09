@@ -1,7 +1,10 @@
 import json
 import os
+import gc
 from contextlib import nullcontext
+from functools import lru_cache
 from pathlib import Path
+from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -9,6 +12,7 @@ from torch import amp
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import joblib
 import shutil
+import xgboost as xgb
 from tqdm import tqdm
 
 from config import (
@@ -20,6 +24,11 @@ from config import (
     NUM_CLASSES,
     EPOCHS,
     LMDB_CACHE_PATH,
+    DISTILL_BATCH_SIZE,
+    DISTILL_NUM_WORKERS,
+    DISTILL_EPOCHS,
+    DISTILL_MAX_EPOCHS,
+    DISTILL_SEARCH_TRIALS,
 )
 from data.dataset_loader import load_labels
 from data.cache import load_from_cache
@@ -35,11 +44,20 @@ def _autocast(device: torch.device):
         return amp.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
 
-XGB_GPU_PARAMS = {
-    "tree_method": "gpu_hist",
-    "predictor": "gpu_predictor",
-    "device": "cuda",
-}
+XGB_FORCE_CPU = os.getenv("XGB_FORCE_CPU", "0").lower() in {"1", "true", "yes"}
+
+
+def _xgb_has_cuda():
+    return hasattr(xgb.core._LIB, "XGDeviceQuantileDMatrixCreate")
+
+
+def _xgb_device_params():
+    if XGB_FORCE_CPU or not _xgb_has_cuda():
+        return {"tree_method": "hist"}
+    return {"tree_method": "hist", "device": "cuda"}
+
+
+XGB_DEVICE_PARAMS = _xgb_device_params()
 
 
 def _move_optimizer_state(optimizer, device):
@@ -58,25 +76,47 @@ def _fallback_to_cpu(model, optimizer, tag: str):
     return device
 
 
+def _cleanup_after_oom(optimizer):
+    optimizer.zero_grad(set_to_none=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _load_xgb_teacher():
     model_path = MODEL_DIR / "xgb_hog.json"
     scaler_path = MODEL_DIR / "xgb_hog_scaler.joblib"
     if not model_path.exists() or not scaler_path.exists():
         return None, None
-    import xgboost as xgb
-
     model = xgb.XGBClassifier()
     model.load_model(model_path)
     try:
-        model.set_params(**XGB_GPU_PARAMS)
-    except ValueError:
-        # Older xgboost versions might not accept device param; ignore silently
-        model.set_params(tree_method="gpu_hist", predictor="gpu_predictor")
+        model.set_params(**XGB_DEVICE_PARAMS)
+    except ValueError as e:
+        print(f"[distill] xgb set_params fallback to CPU hist. ({e})")
+        model.set_params(tree_method="hist")
     scaler = joblib.load(scaler_path)
     return model, scaler
 
 
+def _xgb_predict_proba_with_fallback(model, feats_scaled):
+    try:
+        return model.predict_proba(feats_scaled)
+    except (ValueError, xgb.core.XGBoostError) as e:
+        err = str(e)
+        if not any(token in err for token in ("gpu_hist", "device", "cuda")):
+            raise
+        print(f"[distill] xgb predict fallback to CPU hist. ({e})")
+        model.set_params(tree_method="hist")
+        return model.predict_proba(feats_scaled)
+
+
 def _load_hog_feature(clip: str, cache_mode: str = "prefer"):
+    return _load_hog_feature_cached(clip, cache_mode)
+
+
+@lru_cache(maxsize=8192)
+def _load_hog_feature_cached(clip: str, cache_mode: str = "prefer"):
     cached = None
     if cache_mode != "off":
         cached = load_from_cache(LMDB_CACHE_PATH, clip, split="Train")
@@ -91,6 +131,52 @@ def _load_hog_feature(clip: str, cache_mode: str = "prefer"):
     return feat
 
 
+def _teacher_params_from_metrics(metrics_path: Path) -> dict:
+    if not metrics_path.exists():
+        return {}
+    with open(metrics_path, "r") as f:
+        metrics = json.load(f)
+    return metrics.get("best_params", {}) or {}
+
+
+def _infer_recurrent_params(state_dict: dict) -> Tuple[int, int]:
+    hidden_size = int(state_dict["lstm.weight_ih_l0"].shape[0] // 4)
+    layer_ids = set()
+    for key in state_dict:
+        if not key.startswith("lstm.weight_ih_l"):
+            continue
+        suffix = key.split("lstm.weight_ih_l", 1)[1]
+        layer_ids.add(int(suffix.split("_", 1)[0]))
+    num_layers = len(layer_ids)
+    return hidden_size, num_layers
+
+
+def _build_teacher_from_checkpoint(model_type: str, ckpt_path: Path, device: torch.device):
+    state_dict = torch.load(ckpt_path, map_location="cpu")
+    metrics_path = MODEL_DIR / f"{ckpt_path.stem}_metrics.json"
+    best_params = _teacher_params_from_metrics(metrics_path)
+    hidden_size = int(best_params.get("hidden_size", 0) or 0)
+    num_layers = int(best_params.get("num_layers", 0) or 0)
+    dropout = float(best_params.get("dropout", 0.0) or 0.0)
+    if hidden_size <= 0 or num_layers <= 0:
+        hidden_size, num_layers = _infer_recurrent_params(state_dict)
+
+    ctor = MobileNetV2_LSTM if model_type == "lstm" else MobileNetV2_BiLSTM
+    model = ctor(
+        num_classes=NUM_CLASSES,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+    )
+    model.load_state_dict(state_dict)
+    model.to(device).eval()
+    print(
+        f"[distill] loaded {model_type} teacher "
+        f"(hidden_size={hidden_size}, num_layers={num_layers}, dropout={dropout:.4f})"
+    )
+    return model
+
+
 def _build_teachers(device):
     teachers = []
 
@@ -98,26 +184,26 @@ def _build_teachers(device):
     bilstm_path = MODEL_DIR / "mobilenetv2_bilstm.pt"
 
     if lstm_path.exists():
-        lstm = MobileNetV2_LSTM(num_classes=NUM_CLASSES)
-        lstm.load_state_dict(torch.load(lstm_path, map_location=device))
-        lstm.to(device).eval()
-        teachers.append(lstm)
+        try:
+            teachers.append(_build_teacher_from_checkpoint("lstm", lstm_path, device))
+        except Exception as e:
+            print(f"[distill] failed to load lstm teacher from {lstm_path}: {e}")
 
     if bilstm_path.exists():
-        bilstm = MobileNetV2_BiLSTM(num_classes=NUM_CLASSES)
-        bilstm.load_state_dict(torch.load(bilstm_path, map_location=device))
-        bilstm.to(device).eval()
-        teachers.append(bilstm)
+        try:
+            teachers.append(_build_teacher_from_checkpoint("bilstm", bilstm_path, device))
+        except Exception as e:
+            print(f"[distill] failed to load bilstm teacher from {bilstm_path}: {e}")
 
     return teachers
 
 def _make_loaders(batch_size, cache_path, device: torch.device, cache_mode: str = "prefer"):
     cache = cache_path if cache_path and Path(cache_path).exists() else None
-    force_cache = cache_mode == "force"
+    train_force_cache = cache_mode == "force"
     no_cache = cache_mode == "off"
     df_train = load_labels(LABELS_DIR / "TrainLabels.csv")
     df_val = load_labels(LABELS_DIR / "ValidationLabels.csv")
-    worker_count = min(8, os.cpu_count() or 4)
+    worker_count = min(DISTILL_NUM_WORKERS, os.cpu_count() or DISTILL_NUM_WORKERS)
     pin_mem = device.type == "cuda"
 
     train_ds = VideoFrameDataset(
@@ -129,7 +215,7 @@ def _make_loaders(batch_size, cache_path, device: torch.device, cache_mode: str 
         return_clip_id=True,
         split="Train",
         cache_path=cache,
-        force_cache=force_cache,
+        force_cache=train_force_cache,
         no_cache=no_cache,
     )
     val_ds = VideoFrameDataset(
@@ -141,13 +227,14 @@ def _make_loaders(batch_size, cache_path, device: torch.device, cache_mode: str 
         return_clip_id=False,
         split="Validation",
         cache_path=cache,
-        force_cache=force_cache,
+        force_cache=False,
         no_cache=no_cache,
     )
 
-    class_counts = df_train["Engagement"].value_counts().reindex(range(NUM_CLASSES), fill_value=0).values
+    train_df_filtered = train_ds.df  # may be pruned if frames/cache missing
+    class_counts = train_df_filtered["Engagement"].value_counts().reindex(range(NUM_CLASSES), fill_value=0).values
     weights = 1.0 / (class_counts + 1e-6)
-    sample_weights = torch.DoubleTensor([weights[int(y)] for y in df_train["Engagement"]])
+    sample_weights = torch.DoubleTensor([weights[int(y)] for y in train_df_filtered["Engagement"]])
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
     common_kwargs = {
@@ -156,7 +243,7 @@ def _make_loaders(batch_size, cache_path, device: torch.device, cache_mode: str 
     }
     if worker_count > 0:
         common_kwargs["persistent_workers"] = True
-        common_kwargs["prefetch_factor"] = 2
+        common_kwargs["prefetch_factor"] = 1
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, **common_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **common_kwargs)
@@ -176,6 +263,68 @@ def _eval(model, loader, device, progress_desc: str = None):
             correct += (preds == labels).sum().item()
             total += labels.size(0)
     return correct / total if total else 0.0
+
+
+def _distill_train_step(
+    student,
+    teachers,
+    xgb_model,
+    xgb_scaler,
+    optimizer,
+    scaler,
+    frames,
+    labels,
+    clip_ids,
+    alpha,
+    temperature,
+    device,
+    cache_mode: str,
+):
+    def teacher_probs(teacher_logits):
+        probs = []
+        for logits in teacher_logits:
+            probs.append(F.softmax(logits / temperature, dim=1))
+        if probs:
+            return torch.stack(probs).mean(dim=0)
+        return None
+
+    with torch.no_grad():
+        neural_logits = [t(frames) for t in teachers]
+
+        xgb_logits = None
+        if xgb_model is not None:
+            feats = np.stack([_load_hog_feature(c, cache_mode=cache_mode) for c in clip_ids])
+            feats_scaled = xgb_scaler.transform(feats)
+            xgb_probs = _xgb_predict_proba_with_fallback(xgb_model, feats_scaled)
+            xgb_logits = torch.from_numpy(np.log(xgb_probs + 1e-8)).to(device)
+
+        combined_probs = teacher_probs(neural_logits)
+        if combined_probs is None and xgb_logits is not None:
+            combined_probs = F.softmax(xgb_logits / temperature, dim=1)
+        elif combined_probs is not None and xgb_logits is not None:
+            xgb_soft = F.softmax(xgb_logits / temperature, dim=1)
+            combined_probs = 0.5 * combined_probs + 0.5 * xgb_soft
+
+    optimizer.zero_grad(set_to_none=True)
+    with _autocast(device):
+        student_logits = student(frames)
+        ce_loss = F.cross_entropy(student_logits, labels)
+        if combined_probs is not None:
+            kd_loss = F.kl_div(
+                F.log_softmax(student_logits / temperature, dim=1),
+                combined_probs,
+                reduction="batchmean",
+            ) * (temperature**2)
+            loss = alpha * kd_loss + (1 - alpha) * ce_loss
+        else:
+            loss = ce_loss
+
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(student.parameters(), 2.0)
+    scaler.step(optimizer)
+    scaler.update()
+    return loss.item(), labels.size(0)
 
 
 def _distill_single(
@@ -203,14 +352,6 @@ def _distill_single(
     optimizer = torch.optim.Adam(student.parameters(), lr=lr)
     scaler = amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    def teacher_probs(teacher_logits):
-        probs = []
-        for logits in teacher_logits:
-            probs.append(F.softmax(logits / temperature, dim=1))
-        if probs:
-            return torch.stack(probs).mean(dim=0)
-        return None
-
     epoch_bar = tqdm(range(epochs), desc=f"[distill] a={alpha} T={temperature} epochs", position=0)
     best_acc = -1.0
     bad_epochs = 0
@@ -231,59 +372,41 @@ def _distill_single(
                 )
                 for frames, labels, clip_ids in train_iter:
                     frames, labels = frames.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-
-                    with torch.no_grad():
-                        neural_logits = [t(frames) for t in teachers]
-
-                        xgb_logits = None
-                        if xgb_model is not None:
-                            feats = np.stack([_load_hog_feature(c, cache_mode=cache_mode) for c in clip_ids])
-                            feats_scaled = xgb_scaler.transform(feats)
-                            xgb_probs = xgb_model.predict_proba(feats_scaled)
-                            xgb_logits = torch.from_numpy(np.log(xgb_probs + 1e-8)).to(device)
-
-                        combined_probs = teacher_probs(neural_logits)
-                        if combined_probs is None and xgb_logits is not None:
-                            combined_probs = F.softmax(xgb_logits / temperature, dim=1)
-                        elif combined_probs is not None and xgb_logits is not None:
-                            xgb_soft = F.softmax(xgb_logits / temperature, dim=1)
-                            combined_probs = 0.5 * combined_probs + 0.5 * xgb_soft
-
-                    optimizer.zero_grad(set_to_none=True)
-                    with _autocast(device):
-                        student_logits = student(frames)
-                        ce_loss = F.cross_entropy(student_logits, labels)
-                        if combined_probs is not None:
-                            kd_loss = F.kl_div(
-                                F.log_softmax(student_logits / temperature, dim=1),
-                                combined_probs,
-                                reduction="batchmean",
-                            ) * (temperature**2)
-                            loss = alpha * kd_loss + (1 - alpha) * ce_loss
-                        else:
-                            loss = ce_loss
-
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(student.parameters(), 2.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    total_loss += loss.item() * labels.size(0)
-                    train_iter.set_postfix(loss=f"{loss.item():.4f}", bs=current_batch)
+                    loss_value, batch_items = _distill_train_step(
+                        student,
+                        teachers,
+                        xgb_model,
+                        xgb_scaler,
+                        optimizer,
+                        scaler,
+                        frames,
+                        labels,
+                        clip_ids,
+                        alpha,
+                        temperature,
+                        device,
+                        cache_mode,
+                    )
+                    total_loss += loss_value * batch_items
+                    train_iter.set_postfix(loss=f"{loss_value:.4f}", bs=current_batch)
                 rerun_epoch = False
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    torch.cuda.empty_cache()
+                    _cleanup_after_oom(optimizer)
                     if device.type == "cuda" and current_batch > 1:
                         new_bs = max(1, current_batch // 2)
                         print(f"[distill] OOM at batch_size={current_batch}; retrying with {new_bs}")
                         current_batch = new_bs
-                        train_loader, val_loader, train_ds, _ = _make_loaders(current_batch, cache_path, device)
+                        train_loader, val_loader, train_ds, _ = _make_loaders(
+                            current_batch, cache_path, device, cache_mode=cache_mode
+                        )
                         continue
                     if device.type == "cuda":
                         device = _fallback_to_cpu(student, optimizer, tag="distill")
                         scaler = amp.GradScaler("cuda", enabled=False)
-                        train_loader, val_loader, train_ds, _ = _make_loaders(current_batch, cache_path, device)
+                        train_loader, val_loader, train_ds, _ = _make_loaders(
+                            current_batch, cache_path, device, cache_mode=cache_mode
+                        )
                         continue
                 raise
 
@@ -331,18 +454,23 @@ def _distill_single(
 def distill(
     alpha=0.5,
     temperature=4.0,
-    batch_size=8,
+    batch_size=None,
+    epochs: Optional[int] = None,
     lr=1e-4,
     output_path: Path = MODEL_DIR / "mobilenetv2_tcn_distilled.pt",
     cache_path: Path = LMDB_CACHE_PATH,
     search: bool = False,
     cache_mode: str = "prefer",
 ):
-    # Cap distillation to 8 epochs to keep runs consistent with other models.
-    epochs = min(EPOCHS, 8)
+    if batch_size is None:
+        batch_size = DISTILL_BATCH_SIZE
+    if epochs is None:
+        epochs = DISTILL_EPOCHS
+    epochs = min(max(1, int(epochs)), DISTILL_MAX_EPOCHS)
+
     candidates = [(alpha, temperature)]
     if search:
-        candidates = [(a, t) for a in (0.3, 0.5, 0.7) for t in (2.0, 4.0, 6.0)]
+        candidates = [(a, t) for a in (0.3, 0.5, 0.7) for t in (2.0, 4.0, 6.0)][:DISTILL_SEARCH_TRIALS]
 
     best = {"val_acc": -1, "pt": None, "ts": None, "metrics": None}
     for a, t in candidates:

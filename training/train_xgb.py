@@ -46,7 +46,7 @@ def _xgb_has_cuda():
 def _xgb_device_params():
     if XGB_FORCE_CPU or not _xgb_has_cuda():
         return {"tree_method": "hist"}
-    return {"tree_method": "gpu_hist", "device": "cuda"}
+    return {"tree_method": "hist", "device": "cuda"}
 
 
 XGB_GPU_PARAMS = _xgb_device_params()
@@ -122,12 +122,12 @@ def _fit_with_gpu_fallback(
     early_stopping_rounds: int = None,
 ):
     """
-    Try GPU params first; if unsupported (ValueError mentioning gpu_hist),
+    Try GPU params first; if unsupported,
     fall back to CPU-friendly params. If GPU is known to be unavailable (env
     XGB_FORCE_CPU or CPU-only build), skip straight to CPU to avoid noisy logs.
     """
     params_gpu = params.copy()
-    wants_gpu = params_gpu.get("tree_method") == "gpu_hist"
+    wants_gpu = params_gpu.get("device") == "cuda"
     if not wants_gpu:
         # Already CPU params
         model = xgb.XGBClassifier(**params_gpu)
@@ -154,8 +154,9 @@ def _fit_with_gpu_fallback(
             early_stopping_rounds=early_stopping_rounds,
         )
         return model, params_gpu, "gpu"
-    except ValueError as e:
-        if "gpu_hist" not in str(e):
+    except (ValueError, xgb.core.XGBoostError) as e:
+        err = str(e)
+        if not any(token in err for token in ("gpu_hist", "device", "cuda")):
             raise
         params_cpu = {"tree_method": "hist"}
         params_cpu.update({k: v for k, v in params_gpu.items() if k not in {"tree_method", "device"}})
