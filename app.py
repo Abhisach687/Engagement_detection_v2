@@ -1,1113 +1,1042 @@
+from __future__ import annotations
+
 import json
 import os
 import threading
 import time
-import tkinter as tk
 from collections import deque
 from pathlib import Path
-from tkinter import messagebox, ttk
+from typing import Any
 
 import cv2
 import numpy as np
+import onnxruntime as ort
+import tkinter as tk
 from PIL import Image, ImageTk
 
-try:
-    import onnxruntime as ort
-except ImportError:
-    ort = None
+from utils.affect import AFFECT_COLUMNS, AFFECT_DISPLAY_NAMES, AFFECT_LEVELS
 
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "models"
-SEQ_LEN = 30
-IMG_SIZE = 224
-NUM_CLASSES = 4
+
+DEFAULT_SEQ_LEN = 30
+DEFAULT_IMG_SIZE = 224
+DEFAULT_NUM_CLASSES = 4
+
+WINDOW_MIN_WIDTH = 1366
+WINDOW_MIN_HEIGHT = 768
+CAMERA_PANEL_WIDTH = 820
+ENGAGEMENT_PANEL_WIDTH = 470
+PREVIEW_STAGE_HEIGHT = 430
+
+SPOTLIGHT_THRESHOLD = 0.55
+PRIMARY_CONFIDENCE_THRESHOLD = 0.60
+INFERENCE_INTERVAL_SEC = 0.12
+DISPLAY_BLEND = 0.28
+
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-ENGAGEMENT_LEVELS = ["Very Low", "Low", "High", "Very High"]
+
+DEFAULT_MULTI_HEAD_NAMES = list(AFFECT_COLUMNS)
+
 MODEL_VARIANTS = {
-    "engagement": {"stem": "mobilenetv2_tcn_distilled", "label": "Engagement"},
-    "multiaffect": {"stem": "mobilenetv2_tcn_multiaffect_distilled", "label": "Multi-Affect"},
+    "engagement": {"stem": "mobilenetv2_tcn_distilled", "num_heads": 1},
+    "multiaffect": {"stem": "mobilenetv2_tcn_multiaffect_distilled", "num_heads": len(DEFAULT_MULTI_HEAD_NAMES)},
 }
-AFFECT_CARD_SPECS = (
-    ("bored", 1, "Bored", "Boredom signal", "High + Very High boredom confidence"),
-    ("confused", 2, "Confused", "Confusion signal", "High + Very High confusion confidence"),
-    ("frustrated", 3, "Frustrated", "Frustration signal", "High + Very High frustration confidence"),
-)
-REQUIRE_CUDA = os.getenv("REQUIRE_CUDA", "0").lower() in {"1", "true", "yes"}
-PREVIEW_WIDTH = 768
-PREVIEW_HEIGHT = 432
-CAMERA_WIDTH = 960
-CAMERA_HEIGHT = 540
-UI_REFRESH_MS = 12
-INFERENCE_INTERVAL_MS = 90
-FRAME_SKIP = 2
-BAR_SMOOTHING = 0.12
-EMA_DECAY = 0.90
-APP_BG = "#FFF9EF"
-SURFACE_BG = "#FFFDF8"
-SURFACE_BORDER = "#F0E1C7"
-SURFACE_SHADOW = "#E8D7BB"
-HERO_BG = "#FFF2B8"
-HERO_BORDER = "#F0D067"
-HERO_SHADOW = "#E3C978"
-PREVIEW_PANEL_BG = "#1E2740"
-PREVIEW_BORDER = "#6175E7"
-PREVIEW_SHADOW = "#B8C1E7"
-PREVIEW_TEXT = "#F6F9FF"
-PREVIEW_MUTED = "#B7C3DD"
-ENGAGED_BG = "#E8F6FF"
-ENGAGED_ACCENT = "#62B2F7"
-ENGAGED_SHADOW = "#C9DFF0"
-NOT_ENGAGED_BG = "#FFE7EF"
-NOT_ENGAGED_ACCENT = "#F2A3BE"
-NOT_ENGAGED_SHADOW = "#ECC5D2"
-BORED_BG = "#FFF3D8"
-BORED_ACCENT = "#E0A33B"
-BORED_SHADOW = "#E7D2A4"
-CONFUSED_BG = "#E5F7F5"
-CONFUSED_ACCENT = "#4FB1A7"
-CONFUSED_SHADOW = "#C8E4E0"
-FRUSTRATED_BG = "#FFEADF"
-FRUSTRATED_ACCENT = "#E38864"
-FRUSTRATED_SHADOW = "#EDC8B9"
-TRACK_COLOR = "#FFF8EB"
-TRACK_SHADOW = "#E9DDC9"
-TEXT_PRIMARY = "#23324A"
-TEXT_MUTED = "#6B7790"
-BUTTON_TEXT = "#1E2E48"
-BUTTON_YELLOW = "#FFD766"
-BUTTON_YELLOW_ACTIVE = "#FFE083"
-BUTTON_DARK = "#2A3450"
-BUTTON_DARK_ACTIVE = "#3A4769"
-BUTTON_DARK_TEXT = "#F8FBFF"
-PREVIEW_ASPECT_RATIO = 16 / 9
-MIN_WINDOW_WIDTH = 960
-MIN_WINDOW_HEIGHT = 720
+
+COLORS = {
+    "bg": "#09111f",
+    "panel": "#0d1729",
+    "panel_alt": "#111f35",
+    "panel_soft": "#15233d",
+    "border": "#223655",
+    "border_soft": "#1a2a45",
+    "text": "#edf3fb",
+    "text_soft": "#93a8c5",
+    "text_muted": "#6f84a3",
+    "preview": "#040916",
+    "green": "#31c48d",
+    "green_soft": "#18372f",
+    "amber": "#f6c453",
+    "amber_soft": "#382d14",
+    "red": "#ff7070",
+    "red_soft": "#3a1d24",
+    "blue": "#68b5ff",
+    "blue_soft": "#162d47",
+    "orange": "#ff9d5c",
+    "orange_soft": "#382311",
+    "purple": "#b892ff",
+    "purple_soft": "#2d2141",
+}
+
+HEAD_PALETTES = {
+    "engagement": {"accent": COLORS["green"], "surface": COLORS["green_soft"]},
+    "not_engaged": {"accent": COLORS["red"], "surface": COLORS["red_soft"]},
+    "boredom": {"accent": COLORS["amber"], "surface": COLORS["amber_soft"]},
+    "confusion": {"accent": COLORS["blue"], "surface": COLORS["blue_soft"]},
+    "frustration": {"accent": COLORS["orange"], "surface": COLORS["orange_soft"]},
+    "default": {"accent": COLORS["purple"], "surface": COLORS["purple_soft"]},
+}
+
+STATE_STYLES = {
+    "idle": {"accent": COLORS["text_soft"], "surface": COLORS["panel_soft"], "badge": "Idle"},
+    "warming_up": {"accent": COLORS["amber"], "surface": COLORS["amber_soft"], "badge": "Warming Up"},
+    "live_engaged": {"accent": COLORS["green"], "surface": COLORS["green_soft"], "badge": "Live / Engaged"},
+    "live_not_engaged": {"accent": COLORS["red"], "surface": COLORS["red_soft"], "badge": "Live / Not Engaged"},
+    "live_mixed": {"accent": COLORS["blue"], "surface": COLORS["blue_soft"], "badge": "Live / Mixed"},
+    "error": {"accent": COLORS["red"], "surface": COLORS["red_soft"], "badge": "Error"},
+}
 
 
-def _softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
-    logits = logits - np.max(logits, axis=axis, keepdims=True)
-    probs = np.exp(logits)
-    probs /= np.sum(probs, axis=axis, keepdims=True)
-    return probs
+def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
 
 
-def _format_meta_value(value) -> str:
-    if isinstance(value, float):
-        return f"{value:.4f}"
-    return str(value)
+def mix_color(source: str, target: str, amount: float) -> str:
+    amount = max(0.0, min(1.0, float(amount)))
+    s_r, s_g, s_b = _hex_to_rgb(source)
+    t_r, t_g, t_b = _hex_to_rgb(target)
+    return "#{:02x}{:02x}{:02x}".format(
+        int(s_r + (t_r - s_r) * amount),
+        int(s_g + (t_g - s_g) * amount),
+        int(s_b + (t_b - s_b) * amount),
+    )
 
 
-def mix_color(color_a: str, color_b: str, weight: float) -> str:
-    weight = max(0.0, min(1.0, weight))
-    rgb_a = tuple(int(color_a[idx : idx + 2], 16) for idx in (1, 3, 5))
-    rgb_b = tuple(int(color_b[idx : idx + 2], 16) for idx in (1, 3, 5))
-    mixed = tuple(int(round((1.0 - weight) * a + weight * b)) for a, b in zip(rgb_a, rgb_b))
-    return "#" + "".join(f"{value:02X}" for value in mixed)
+def _normalize_head_name(name: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "_" for ch in str(name)).strip("_")
 
 
-def clamp(value: int, lower: int, upper: int) -> int:
-    return max(lower, min(upper, value))
+def _display_head_name(name: str) -> str:
+    cleaned = str(name).strip()
+    return AFFECT_DISPLAY_NAMES.get(cleaned, cleaned.replace("_", " ").title())
 
 
-def _select_providers():
-    if ort is None:
-        raise RuntimeError(
-            "onnxruntime is not installed. Install it with `pip install onnxruntime-gpu` "
-            "or `pip install onnxruntime`."
-        )
-
-    available = ort.get_available_providers()
-    if REQUIRE_CUDA and "CUDAExecutionProvider" in available:
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return ["CPUExecutionProvider"]
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    shifted = logits - np.max(logits)
+    exp = np.exp(shifted)
+    total = exp.sum()
+    if not np.isfinite(total) or total <= 0.0:
+        return np.full_like(exp, 1.0 / len(exp), dtype=np.float32)
+    return (exp / total).astype(np.float32)
 
 
-def _resolve_model_variant() -> str:
-    multiaffect_stem = MODEL_VARIANTS["multiaffect"]["stem"]
-    for suffix in (".onnx", ".ts", ".pt"):
-        if (MODEL_DIR / f"{multiaffect_stem}{suffix}").exists():
-            return "multiaffect"
-    return "engagement"
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _onnx_meta_path(onnx_path: Path) -> Path:
     return onnx_path.with_name(f"{onnx_path.stem}_onnx_meta.json")
 
 
-def _load_onnx_export_meta(onnx_path: Path) -> dict:
-    meta_path = _onnx_meta_path(onnx_path)
-    if not meta_path.exists():
-        return {}
-    with open(meta_path, "r") as handle:
-        return json.load(handle)
+def _load_onnx_export_meta(onnx_path: Path) -> dict[str, Any]:
+    return _load_json(_onnx_meta_path(onnx_path))
 
 
-def ensure_onnx_model(onnx_path: Path, variant: str):
+def _variant_artifacts_exist(variant: str) -> bool:
+    stem = MODEL_VARIANTS[variant]["stem"]
+    for suffix in (".onnx", ".ts", ".pt"):
+        if (MODEL_DIR / f"{stem}{suffix}").exists():
+            return True
+    return False
+
+
+def _resolve_model_variant(variant: str = "auto") -> str:
+    if variant != "auto":
+        return variant
+    if _variant_artifacts_exist("multiaffect"):
+        return "multiaffect"
+    return "engagement"
+
+
+def ensure_onnx_model(variant: str = "auto") -> tuple[Path, str]:
+    resolved_variant = _resolve_model_variant(variant)
+    stem = MODEL_VARIANTS[resolved_variant]["stem"]
+    onnx_path = MODEL_DIR / f"{stem}.onnx"
     if onnx_path.exists():
-        return
+        return onnx_path, resolved_variant
 
+    previous = os.environ.get("REQUIRE_CUDA")
+    os.environ["REQUIRE_CUDA"] = "0"
     try:
         from onxx_port import export_onnx
-    except Exception as exc:
-        raise RuntimeError(
-            f"Missing ONNX model at {onnx_path}. Automatic export setup failed: {exc}"
-        ) from exc
 
-    print(f"[app] missing ONNX model, exporting {onnx_path.name} from distilled weights...")
+        export_onnx(onnx_path, variant=resolved_variant)
+    finally:
+        if previous is None:
+            os.environ.pop("REQUIRE_CUDA", None)
+        else:
+            os.environ["REQUIRE_CUDA"] = previous
+
+    if not onnx_path.exists():
+        raise FileNotFoundError(f"ONNX export failed for {resolved_variant}: {onnx_path}")
+    return onnx_path, resolved_variant
+
+
+def _available_providers() -> tuple[list[str], str]:
+    providers = ort.get_available_providers()
+    if "CUDAExecutionProvider" in providers:
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"], "CUDA"
+    return ["CPUExecutionProvider"], "CPU"
+
+
+def load_model(variant: str = "auto") -> dict[str, Any]:
+    onnx_path, resolved_variant = ensure_onnx_model(variant)
+    meta = _load_onnx_export_meta(onnx_path)
+    variant_name = str(meta.get("variant") or resolved_variant)
+    providers, device_label = _available_providers()
+    session_options = ort.SessionOptions()
+    session_options.log_severity_level = 3
     try:
-        export_onnx(onnx_path, variant=variant)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Missing ONNX model at {onnx_path}. Automatic export failed: {exc}"
-        ) from exc
+        session = ort.InferenceSession(str(onnx_path), sess_options=session_options, providers=providers)
+    except Exception:
+        session = ort.InferenceSession(str(onnx_path), sess_options=session_options, providers=["CPUExecutionProvider"])
+        device_label = "CPU"
+
+    input_name = str(meta.get("input_name") or session.get_inputs()[0].name)
+    output_name = str(meta.get("output_name") or session.get_outputs()[0].name)
+    class_count = int(meta.get("num_classes") or DEFAULT_NUM_CLASSES)
+    seq_len = int(meta.get("seq_len") or DEFAULT_SEQ_LEN)
+    img_size = int(meta.get("img_size") or DEFAULT_IMG_SIZE)
+    head_count = int(meta.get("num_heads") or MODEL_VARIANTS.get(variant_name, MODEL_VARIANTS["engagement"])["num_heads"])
+    default_head_names = ["Engagement"] if head_count == 1 else DEFAULT_MULTI_HEAD_NAMES[:head_count]
+    head_names = [str(name) for name in (meta.get("head_names") or default_head_names)][:head_count]
+    while len(head_names) < head_count:
+        head_names.append(f"Head {len(head_names) + 1}")
+
+    stem = MODEL_VARIANTS.get(variant_name, MODEL_VARIANTS[resolved_variant])["stem"]
+    metrics = _load_json(MODEL_DIR / f"{stem}_metrics.json")
+
+    return {
+        "session": session,
+        "onnx_path": onnx_path,
+        "variant": variant_name,
+        "metrics": metrics,
+        "meta": meta,
+        "device_label": device_label,
+        "providers": session.get_providers(),
+        "input_name": input_name,
+        "output_name": output_name,
+        "head_count": head_count,
+        "head_names": head_names,
+        "class_count": class_count,
+        "seq_len": seq_len,
+        "img_size": img_size,
+    }
 
 
-def load_model():
-    variant = _resolve_model_variant()
-    stem = MODEL_VARIANTS[variant]["stem"]
-    onnx_path = MODEL_DIR / f"{stem}.onnx"
-    ensure_onnx_model(onnx_path, variant)
-
-    providers = _select_providers()
-    session = ort.InferenceSession(str(onnx_path), providers=providers)
-    device_label = "cuda" if "CUDAExecutionProvider" in session.get_providers() else "cpu"
-    meta_path = MODEL_DIR / f"{stem}_metrics.json"
-    meta = {}
-    if meta_path.exists():
-        with open(meta_path, "r") as handle:
-            meta = json.load(handle)
-    onnx_meta = _load_onnx_export_meta(onnx_path)
-    runtime_variant = onnx_meta.get("variant", variant)
-    if runtime_variant not in MODEL_VARIANTS:
-        runtime_variant = variant
-    return session, meta, onnx_meta, device_label, runtime_variant
+def preprocess(frames: list[np.ndarray], img_size: int) -> np.ndarray:
+    processed = []
+    for frame in frames:
+        resized = cv2.resize(frame, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        normalized = (rgb - IMAGENET_MEAN) / IMAGENET_STD
+        processed.append(np.transpose(normalized, (2, 0, 1)))
+    return np.expand_dims(np.stack(processed, axis=0).astype(np.float32), axis=0)
 
 
-SESSION, MODEL_META, ONNX_EXPORT_META, DEVICE_LABEL, MODEL_VARIANT = load_model()
-MODEL_HEAD_COUNT = int(ONNX_EXPORT_META.get("num_heads", len(AFFECT_CARD_SPECS) + 1 if MODEL_VARIANT == "multiaffect" else 1))
-print(f"[app] using backend: onnx | device: {DEVICE_LABEL} | variant: {MODEL_VARIANT} | heads: {MODEL_HEAD_COUNT}")
-INPUT_NAME = SESSION.get_inputs()[0].name
+def predict_output(
+    session: ort.InferenceSession,
+    input_name: str,
+    output_name: str,
+    frames: list[np.ndarray],
+    img_size: int,
+    class_count: int,
+    head_count: int,
+) -> np.ndarray:
+    inputs = preprocess(frames, img_size)
+    raw_output = np.asarray(session.run([output_name], {input_name: inputs})[0])
+
+    if raw_output.ndim == 3:
+        logits = raw_output[0]
+    elif raw_output.ndim == 2:
+        if raw_output.shape[0] == 1 and raw_output.shape[1] in {class_count, head_count * class_count}:
+            logits = raw_output.reshape(-1, class_count)
+        else:
+            logits = raw_output
+    elif raw_output.ndim == 1:
+        if raw_output.size % class_count != 0:
+            raise ValueError(f"Unsupported logits size: {raw_output.shape}")
+        logits = raw_output.reshape(-1, class_count)
+    else:
+        raise ValueError(f"Unsupported ONNX output shape: {raw_output.shape}")
+
+    if logits.ndim != 2 or logits.shape[1] != class_count:
+        raise ValueError(f"Unexpected logits shape after reshape: {logits.shape}")
+
+    probabilities = np.stack([_softmax(row) for row in logits], axis=0)
+    return probabilities.astype(np.float32)
 
 
-def preprocess(frame_bgr: np.ndarray) -> np.ndarray:
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
-    arr = resized.astype(np.float32) / 255.0
-    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
-    return np.transpose(arr, (2, 0, 1))
-
-
-def predict_output(batch: np.ndarray) -> np.ndarray:
-    logits = SESSION.run(None, {INPUT_NAME: batch.astype(np.float32, copy=False)})[0]
-    probs = _softmax(np.asarray(logits, dtype=np.float32), axis=-1)
-    output = probs[0]
-    if MODEL_VARIANT == "multiaffect" and output.ndim == 1 and output.size == MODEL_HEAD_COUNT * NUM_CLASSES:
-        output = output.reshape(MODEL_HEAD_COUNT, NUM_CLASSES)
-    return output
-
-
-def open_camera():
-    backends = []
-    if hasattr(cv2, "CAP_DSHOW"):
-        backends.append(cv2.CAP_DSHOW)
-    backends.append(None)
-
-    for backend in backends:
-        cap = cv2.VideoCapture(0, backend) if backend is not None else cv2.VideoCapture(0)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-            return cap
-        cap.release()
-    return None
+def open_camera(index: int = 0) -> cv2.VideoCapture:
+    capture = cv2.VideoCapture(index, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(index)
+    if not capture or not capture.isOpened():
+        capture = cv2.VideoCapture(index)
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    return capture
 
 
 class EngagementApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, runtime: dict[str, Any]):
         self.root = root
-        self.root.title("Engagement Detection")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.resizable(True, True)
-        self.root.configure(bg=APP_BG)
-        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
-        self.is_multiaffect = MODEL_VARIANT == "multiaffect"
+        self.session = runtime["session"]
+        self.onnx_path = runtime["onnx_path"]
+        self.model_variant = runtime["variant"]
+        self.metrics = runtime["metrics"]
+        self.meta = runtime["meta"]
+        self.device_label = runtime["device_label"]
+        self.providers = runtime["providers"]
+        self.input_name = runtime["input_name"]
+        self.output_name = runtime["output_name"]
+        self.head_count = runtime["head_count"]
+        self.head_names = runtime["head_names"]
+        self.class_count = runtime["class_count"]
+        self.seq_len = runtime["seq_len"]
+        self.img_size = runtime["img_size"]
 
-        self.screen_width = self.root.winfo_screenwidth()
-        self.screen_height = self.root.winfo_screenheight()
-        layout = self._calculate_layout_metrics(self.screen_width, self.screen_height)
-        self.preview_width = layout["preview_width"]
-        self.preview_height = layout["preview_height"]
-        self.slider_width = layout["slider_width"]
-        self.hero_wrap = layout["hero_wrap"]
-        self.metric_wrap = layout["metric_wrap"]
-        self.meta_wrap = layout["meta_wrap"]
-        self.container_pad_x = layout["pad_x"]
-        self.container_pad_y = layout["pad_y"]
-        self.scroll_canvas = None
-        self.scroll_window = None
-        self._maximize_window()
+        self.engagement_head_index = next(
+            (index for index, name in enumerate(self.head_names) if _normalize_head_name(name) == "engagement"),
+            0,
+        )
+        split = max(1, self.class_count // 2)
+        self.negative_class_indices = tuple(range(split))
+        self.positive_class_indices = tuple(range(split, self.class_count))
 
-        self.cap = None
+        self.frame_buffer: deque[np.ndarray] = deque(maxlen=self.seq_len)
+        self.capture: cv2.VideoCapture | None = None
         self.running = False
-        self.window = deque(maxlen=SEQ_LEN)
-        self.ema_output = self._neutral_output()
-        self.display_output = self.ema_output.copy()
-        self.preview_image = None
-        self.capture_thread = None
-        self.state_lock = threading.Lock()
-        self.latest_frame_bgr = None
-        self.last_render_tick = time.perf_counter()
-        self.last_inference_tick = 0.0
-        self.preview_item = None
-        self.capture_count = 0
+        self.closing = False
+        self.capture_after_id: str | None = None
+        self.ui_after_id: str | None = None
+        self.preview_photo: ImageTk.PhotoImage | None = None
+        self.last_frame: np.ndarray | None = None
+        self.last_prediction_time = 0.0
+        self.inference_busy = False
+        self.session_token = 0
 
-        self.status_var = tk.StringVar(value="Idle")
-        self.prediction_var = tk.StringVar(value="Awaiting webcam feed")
-        self.summary_var = tk.StringVar(value="Start the camera to light up the dashboard.")
-        self.fps_var = tk.StringVar(value="Preview 0.0 FPS")
-        self.preview_badge_var = tk.StringVar(value="Offline")
-        self.preview_footer_var = tk.StringVar(value=self._idle_footer_text())
-        self.metric_widgets = {}
-        self.status_chip = None
-        self.preview_badge = None
+        self.output_lock = threading.Lock()
+        self.pending_output: np.ndarray | None = None
+        self.pending_error: str | None = None
+        self.display_output = self._neutral_output()
+        self.target_output = self._neutral_output()
 
+        self.head_specs = self._build_head_specs()
+        self.secondary_specs = [spec for spec in self.head_specs if spec["index"] != self.engagement_head_index]
+        self.signal_tiles: dict[str, dict[str, Any]] = {}
+        self.state = "idle"
+
+        self.status_var = tk.StringVar(value=STATE_STYLES["idle"]["badge"])
+        self.preview_badge_var = tk.StringVar(value="Idle")
+        self.prediction_var = tk.StringVar(value="Camera Idle")
+        self.confidence_var = tk.StringVar(value="Waiting for live input")
+        self.summary_var = tk.StringVar(value=self._idle_summary())
+        self.footer_var = tk.StringVar(value=self._idle_footer())
+        self.meta_var = tk.StringVar(value=self._meta_text())
+        self.spotlight_label_var = tk.StringVar(value="Secondary Spotlight")
+        self.spotlight_value_var = tk.StringVar(value=self._spotlight_idle_title())
+        self.spotlight_detail_var = tk.StringVar(value=self._spotlight_idle_detail())
+
+        self._set_initial_window()
         self._build_ui()
-        self._set_binary_values(0.0, 0.0)
-        self._set_affect_values(None)
+        self._update_spotlight(None)
+        self._update_signal_tiles(self.display_output, None)
         self._apply_state_palette("idle")
-
-    def _build_ui(self):
-        self.root.grid_rowconfigure(0, weight=1)
-        self.root.grid_columnconfigure(0, weight=1)
-
-        viewport = tk.Frame(self.root, bg=APP_BG)
-        viewport.grid(row=0, column=0, sticky="nsew")
-        viewport.grid_rowconfigure(0, weight=1)
-        viewport.grid_columnconfigure(0, weight=1)
-
-        self.scroll_canvas = tk.Canvas(viewport, bg=APP_BG, highlightthickness=0, bd=0)
-        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=self.scroll_canvas.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
-
-        container = tk.Frame(
-            self.scroll_canvas,
-            bg=APP_BG,
-            padx=self.container_pad_x,
-            pady=self.container_pad_y,
-        )
-        self.scroll_window = self.scroll_canvas.create_window((0, 0), window=container, anchor="nw")
-        self.scroll_canvas.bind("<Configure>", self._on_canvas_configure)
-        container.bind("<Configure>", self._on_container_configure)
-        self.scroll_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        container.grid_columnconfigure(0, weight=1)
-
-        hero_card = self._create_panel(
-            container,
-            row=0,
-            background=HERO_BG,
-            border=HERO_BORDER,
-            shadow=HERO_SHADOW,
-            pady=(0, 18),
-        )
-        hero_card.grid_columnconfigure(0, weight=1)
-        hero_card.grid_columnconfigure(1, weight=0)
-
-        hero_left = tk.Frame(hero_card, bg=HERO_BG)
-        hero_left.grid(row=0, column=0, sticky="nw")
-        tk.Label(
-            hero_left,
-            text="Focus Pulse",
-            font=("Segoe UI", 24, "bold"),
-            bg=HERO_BG,
-            fg=TEXT_PRIMARY,
-        ).grid(row=0, column=0, sticky="w")
-        tk.Label(
-            hero_left,
-            text=self._hero_subtitle(),
-            font=("Segoe UI", 11),
-            bg=HERO_BG,
-            fg=TEXT_MUTED,
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
-
-        chip_row = tk.Frame(hero_left, bg=HERO_BG)
-        chip_row.grid(row=2, column=0, sticky="w", pady=(16, 0))
-        self.status_chip = tk.Label(
-            chip_row,
-            textvariable=self.status_var,
-            font=("Segoe UI", 10, "bold"),
-            bg="#FFFDF5",
-            fg=TEXT_PRIMARY,
-            padx=14,
-            pady=6,
-        )
-        self.status_chip.grid(row=0, column=0, padx=(0, 8))
-        tk.Label(
-            chip_row,
-            text=f"{DEVICE_LABEL.upper()} | ONNX | {MODEL_VARIANTS[MODEL_VARIANT]['label'].upper()}",
-            font=("Segoe UI", 10, "bold"),
-            bg="#FFF8D6",
-            fg=TEXT_PRIMARY,
-            padx=14,
-            pady=6,
-        ).grid(row=0, column=1, padx=(0, 8))
-        tk.Label(
-            chip_row,
-            textvariable=self.fps_var,
-            font=("Segoe UI", 10, "bold"),
-            bg="#FFF2EE",
-            fg=TEXT_PRIMARY,
-            padx=14,
-            pady=6,
-        ).grid(row=0, column=2)
-
-        hero_right = tk.Frame(hero_card, bg=HERO_BG)
-        hero_right.grid(row=0, column=1, sticky="ne", padx=(28, 0))
-        tk.Label(
-            hero_right,
-            text="Live Decision",
-            font=("Segoe UI", 10, "bold"),
-            bg=HERO_BG,
-            fg=TEXT_MUTED,
-        ).grid(row=0, column=0, sticky="e")
-        tk.Label(
-            hero_right,
-            textvariable=self.prediction_var,
-            font=("Segoe UI", 20, "bold"),
-            bg=HERO_BG,
-            fg=TEXT_PRIMARY,
-            justify="right",
-            wraplength=self.hero_wrap,
-        ).grid(row=1, column=0, sticky="e", pady=(6, 0))
-        tk.Label(
-            hero_right,
-            textvariable=self.summary_var,
-            font=("Segoe UI", 10),
-            bg=HERO_BG,
-            fg=TEXT_MUTED,
-            justify="right",
-            wraplength=self.hero_wrap,
-        ).grid(row=2, column=0, sticky="e", pady=(8, 14))
-
-        button_row = tk.Frame(hero_right, bg=HERO_BG)
-        button_row.grid(row=3, column=0, sticky="e")
-        tk.Button(
-            button_row,
-            text="Start Webcam",
-            command=self.start,
-            bg=BUTTON_YELLOW,
-            fg=BUTTON_TEXT,
-            activebackground=BUTTON_YELLOW_ACTIVE,
-            activeforeground=BUTTON_TEXT,
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            font=("Segoe UI", 11, "bold"),
-            padx=16,
-            pady=10,
-        ).grid(row=0, column=0, padx=(0, 10))
-        tk.Button(
-            button_row,
-            text="Stop Webcam",
-            command=self.stop,
-            bg=BUTTON_DARK,
-            fg=BUTTON_DARK_TEXT,
-            activebackground=BUTTON_DARK_ACTIVE,
-            activeforeground=BUTTON_DARK_TEXT,
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            font=("Segoe UI", 11, "bold"),
-            padx=16,
-            pady=10,
-        ).grid(row=0, column=1)
-
-        self.metric_widgets["engaged"] = self._create_metric_card(
-            container,
-            row=1,
-            title="Engaged",
-            eyebrow="Attention signal",
-            subtitle="High + Very High engagement confidence",
-            background=ENGAGED_BG,
-            accent=ENGAGED_ACCENT,
-            shadow=ENGAGED_SHADOW,
-        )
-
-        preview_card = self._create_panel(
-            container,
-            row=2,
-            background=PREVIEW_PANEL_BG,
-            border=PREVIEW_BORDER,
-            shadow=PREVIEW_SHADOW,
-            pady=(0, 18),
-        )
-
-        preview_header = tk.Frame(preview_card, bg=PREVIEW_PANEL_BG)
-        preview_header.grid(row=0, column=0, sticky="ew")
-        preview_header.grid_columnconfigure(0, weight=1)
-        tk.Label(
-            preview_header,
-            text="Live Webcam",
-            font=("Segoe UI", 18, "bold"),
-            bg=PREVIEW_PANEL_BG,
-            fg=PREVIEW_TEXT,
-        ).grid(row=0, column=0, sticky="w")
-        tk.Label(
-            preview_header,
-            text=self._preview_subtitle(),
-            font=("Segoe UI", 10),
-            bg=PREVIEW_PANEL_BG,
-            fg=PREVIEW_MUTED,
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self.preview_badge = tk.Label(
-            preview_header,
-            textvariable=self.preview_badge_var,
-            font=("Segoe UI", 10, "bold"),
-            bg="#FAE393",
-            fg=TEXT_PRIMARY,
-            padx=14,
-            pady=6,
-        )
-        self.preview_badge.grid(row=0, column=1, rowspan=2, sticky="e")
-
-        preview_shell = tk.Frame(
-            preview_card,
-            bg=mix_color(PREVIEW_PANEL_BG, "#000000", 0.16),
-            highlightthickness=1,
-            highlightbackground=mix_color(PREVIEW_BORDER, "#FFFFFF", 0.25),
-            padx=10,
-            pady=10,
-        )
-        preview_shell.grid(row=1, column=0, sticky="ew", pady=(16, 12))
-        self.preview_canvas = tk.Canvas(
-            preview_shell,
-            width=self.preview_width,
-            height=self.preview_height,
-            bg="#0E1528",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-        )
-        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
-        self._set_preview_placeholder()
-
-        tk.Label(
-            preview_card,
-            textvariable=self.preview_footer_var,
-            justify="left",
-            bg=PREVIEW_PANEL_BG,
-            fg=PREVIEW_MUTED,
-            font=("Segoe UI", 10),
-        ).grid(row=2, column=0, sticky="w")
-
-        self.metric_widgets["not_engaged"] = self._create_metric_card(
-            container,
-            row=3,
-            title="Not Engaged",
-            eyebrow="Attention drift",
-            subtitle="Very Low + Low engagement confidence",
-            background=NOT_ENGAGED_BG,
-            accent=NOT_ENGAGED_ACCENT,
-            shadow=NOT_ENGAGED_SHADOW,
-        )
-
-        next_row = 4
-        if self.is_multiaffect:
-            card_colors = {
-                "bored": (BORED_BG, BORED_ACCENT, BORED_SHADOW),
-                "confused": (CONFUSED_BG, CONFUSED_ACCENT, CONFUSED_SHADOW),
-                "frustrated": (FRUSTRATED_BG, FRUSTRATED_ACCENT, FRUSTRATED_SHADOW),
-            }
-            for key, _head_idx, title, eyebrow, subtitle in AFFECT_CARD_SPECS:
-                background, accent, shadow = card_colors[key]
-                self.metric_widgets[key] = self._create_metric_card(
-                    container,
-                    row=next_row,
-                    title=title,
-                    eyebrow=eyebrow,
-                    subtitle=subtitle,
-                    background=background,
-                    accent=accent,
-                    shadow=shadow,
-                )
-                next_row += 1
-
-        meta_card = self._create_panel(
-            container,
-            row=next_row,
-            background=SURFACE_BG,
-            border=SURFACE_BORDER,
-            shadow=SURFACE_SHADOW,
-        )
-        tk.Label(
-            meta_card,
-            text=self._meta_text(),
-            justify="left",
-            bg=SURFACE_BG,
-            fg=TEXT_MUTED,
-            font=("Segoe UI", 10),
-            wraplength=self.meta_wrap,
-        ).grid(row=0, column=0, sticky="w")
-
-    def _hero_subtitle(self) -> str:
-        if self.is_multiaffect:
-            return "Multi-affect dashboard driven by the distilled four-head MobileNetV2 + TCN student"
-        return "Binary engagement dashboard driven by the distilled MobileNetV2 + TCN model"
-
-    def _preview_subtitle(self) -> str:
-        if self.is_multiaffect:
-            return "Realtime preview plus smoothed engagement, boredom, confusion, and frustration inference"
-        return "Realtime preview plus smoothed binary inference"
-
-    def _idle_footer_text(self) -> str:
-        if self.is_multiaffect:
-            return (
-                f"Multi-affect view | engagement + boredom + confusion + frustration | "
-                f"frame skip {FRAME_SKIP} | infer every {INFERENCE_INTERVAL_MS} ms"
-            )
-        return f"Binary engagement view | frame skip {FRAME_SKIP} | infer every {INFERENCE_INTERVAL_MS} ms"
-
-    def _live_footer_text(self) -> str:
-        if self.is_multiaffect:
-            return (
-                f"Multi-affect trend from four emotion heads | frame skip {FRAME_SKIP} | "
-                f"infer every {INFERENCE_INTERVAL_MS} ms"
-            )
-        return f"Binary trend from four raw classes | frame skip {FRAME_SKIP} | infer every {INFERENCE_INTERVAL_MS} ms"
 
     def _neutral_output(self) -> np.ndarray:
-        shape = (len(AFFECT_CARD_SPECS) + 1, NUM_CLASSES) if self.is_multiaffect else (NUM_CLASSES,)
-        return np.full(shape, 1.0 / NUM_CLASSES, dtype=np.float32)
+        return np.full((self.head_count, self.class_count), 1.0 / max(1, self.class_count), dtype=np.float32)
+
+    def _idle_summary(self) -> str:
+        if self.model_variant == "multiaffect":
+            return "Start the camera to monitor engagement with contextual boredom, confusion, and frustration."
+        return "Start the camera to monitor engagement from the distilled student model."
+
+    def _idle_footer(self) -> str:
+        return f"Ready. Live decisions begin after {self.seq_len} buffered frames."
+
+    def _spotlight_idle_title(self) -> str:
+        if self.secondary_specs:
+            return "Secondary signals stable"
+        return "Engagement-only model active"
+
+    def _spotlight_idle_detail(self) -> str:
+        if self.secondary_specs:
+            return "No non-engagement spotlight is active until live inference begins."
+        return "This ONNX export exposes only the engagement head."
+
+    def _metric_summary(self) -> str:
+        if self.model_variant == "multiaffect":
+            score = self.metrics.get("best_mean_accuracy")
+            if score is not None:
+                return f"Mean val {float(score) * 100:.1f}%"
+        score = self.metrics.get("val_accuracy")
+        if score is not None:
+            return f"Val {float(score) * 100:.1f}%"
+        return "Metrics loaded"
 
     def _meta_text(self) -> str:
-        parts = [
-            "Backend: onnxruntime",
-            f"Device: {DEVICE_LABEL}",
-            f"Variant: {MODEL_VARIANTS[MODEL_VARIANT]['label']}",
-            f"Heads: {MODEL_HEAD_COUNT}",
-        ]
-        if "alpha" in MODEL_META:
-            parts.append(f"alpha={_format_meta_value(MODEL_META['alpha'])}")
-        if "temperature" in MODEL_META:
-            parts.append(f"T={_format_meta_value(MODEL_META['temperature'])}")
-        if self.is_multiaffect:
-            if "best_mean_accuracy" in MODEL_META:
-                parts.append(f"mean_acc={_format_meta_value(MODEL_META['best_mean_accuracy'])}")
-            if "best_exact_match" in MODEL_META:
-                parts.append(f"exact_match={_format_meta_value(MODEL_META['best_exact_match'])}")
-            if MODEL_META.get("initialized_from"):
-                parts.append(f"warm_start={MODEL_META['initialized_from'].get('checkpoint', '?')}")
-        elif "val_accuracy" in MODEL_META:
-            parts.append(f"val_acc={_format_meta_value(MODEL_META['val_accuracy'])}")
-        source_path = ONNX_EXPORT_META.get("source_path")
-        if source_path:
-            parts.append(f"onnx_source={Path(source_path).name}")
-        return " | ".join(parts)
-
-    def _calculate_layout_metrics(self, screen_width: int, screen_height: int):
-        pad_x = clamp(int(screen_width * 0.018), 16, 28)
-        pad_y = clamp(int(screen_height * 0.018), 14, 24)
-        preview_height = clamp(int(screen_height * 0.30), 230, 420)
-        preview_width = int(preview_height * PREVIEW_ASPECT_RATIO)
-        preview_width = min(preview_width, clamp(int(screen_width * 0.78), 460, 1100))
-        preview_height = int(preview_width / PREVIEW_ASPECT_RATIO)
-        slider_width = clamp(int(screen_width * 0.64), 460, 920)
-        hero_wrap = clamp(int(screen_width * 0.24), 250, 360)
-        metric_wrap = clamp(slider_width - 120, 320, 720)
-        meta_wrap = clamp(int(screen_width * 0.78), 520, 1100)
-        return {
-            "pad_x": pad_x,
-            "pad_y": pad_y,
-            "preview_width": preview_width,
-            "preview_height": preview_height,
-            "slider_width": slider_width,
-            "hero_wrap": hero_wrap,
-            "metric_wrap": metric_wrap,
-            "meta_wrap": meta_wrap,
-        }
-
-    def _maximize_window(self):
-        try:
-            self.root.state("zoomed")
-            return
-        except tk.TclError:
-            pass
-
-        try:
-            self.root.attributes("-zoomed", True)
-            return
-        except tk.TclError:
-            pass
-
-        self.root.geometry(f"{self.screen_width}x{self.screen_height}+0+0")
-
-    def _on_canvas_configure(self, event):
-        if self.scroll_canvas is not None and self.scroll_window is not None:
-            self.scroll_canvas.itemconfigure(self.scroll_window, width=event.width)
-
-    def _on_container_configure(self, _event):
-        if self.scroll_canvas is not None:
-            self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
-
-    def _on_mousewheel(self, event):
-        if self.scroll_canvas is None:
-            return
-        self.scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _create_panel(self, parent, row: int, background: str, border: str, shadow: str, pady=(0, 0)):
-        shell = tk.Frame(parent, bg=shadow, bd=0, highlightthickness=0)
-        shell.grid(row=row, column=0, sticky="ew", pady=pady)
-        shell.grid_columnconfigure(0, weight=1)
-        card = tk.Frame(
-            shell,
-            bg=background,
-            highlightthickness=1,
-            highlightbackground=border,
-            padx=20,
-            pady=18,
+        return (
+            f"{self.model_variant.title()} model | {self.head_count} head{'s' if self.head_count != 1 else ''} | "
+            f"Seq {self.seq_len} | {self.img_size}px | {self._metric_summary()}"
         )
-        card.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
-        card.grid_columnconfigure(0, weight=1)
-        return card
 
-    def _create_metric_card(
-        self,
-        parent,
-        row: int,
-        title: str,
-        eyebrow: str,
-        subtitle: str,
-        background: str,
-        accent: str,
-        shadow: str,
-    ):
-        card = self._create_panel(parent, row=row, background=background, border=accent, shadow=shadow, pady=(0, 18))
-        card.grid_columnconfigure(0, weight=1)
-        card.grid_columnconfigure(1, weight=0)
+    def _build_head_specs(self) -> list[dict[str, Any]]:
+        specs = []
+        for index, name in enumerate(self.head_names):
+            key = _normalize_head_name(name)
+            palette = HEAD_PALETTES.get(key, HEAD_PALETTES["default"])
+            specs.append(
+                {
+                    "index": index,
+                    "name": str(name),
+                    "label": _display_head_name(name),
+                    "accent": palette["accent"],
+                    "surface": palette["surface"],
+                }
+            )
+        return specs
 
+    def _set_initial_window(self) -> None:
+        self.root.title("Live Engagement Monitor")
+        self.root.configure(bg=COLORS["bg"])
+        self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.root.option_add("*Font", "{Segoe UI} 10")
+
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        width = min(max(WINDOW_MIN_WIDTH, screen_w - 96), 1600)
+        height = min(max(WINDOW_MIN_HEIGHT, screen_h - 96), 920)
+        x_pos = max(24, int((screen_w - width) / 2))
+        y_pos = max(24, int((screen_h - height) / 2))
+        self.root.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
+
+    def _create_card(self, parent: tk.Misc, bg: str | None = None, border: str | None = None) -> tk.Frame:
+        return tk.Frame(
+            parent,
+            bg=bg or COLORS["panel"],
+            highlightthickness=1,
+            highlightbackground=border or COLORS["border"],
+            bd=0,
+        )
+
+    def _create_chip(self, parent: tk.Misc, text: str, bg: str, fg: str | None = None) -> tk.Label:
+        return tk.Label(
+            parent,
+            text=text,
+            bg=bg,
+            fg=fg or COLORS["text"],
+            padx=12,
+            pady=6,
+            font=("Segoe UI Semibold", 9),
+        )
+
+    def _create_button(self, parent: tk.Misc, text: str, command, bg: str, fg: str = COLORS["text"]) -> tk.Button:
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=mix_color(bg, "#ffffff", 0.12),
+            activeforeground=fg,
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+            cursor="hand2",
+        )
+
+    def _create_stat_block(self, parent: tk.Misc, title: str) -> dict[str, Any]:
+        frame = self._create_card(parent, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+        title_label = tk.Label(frame, text=title, bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 9))
+        value_label = tk.Label(frame, text="50%", bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 20))
+        detail_label = tk.Label(frame, text="Band share", bg=COLORS["panel_alt"], fg=COLORS["text_muted"], font=("Segoe UI", 9))
+        title_label.pack(anchor="w", padx=14, pady=(12, 2))
+        value_label.pack(anchor="w", padx=14)
+        detail_label.pack(anchor="w", padx=14, pady=(0, 12))
+        return {"frame": frame, "value": value_label, "detail": detail_label}
+
+    def _build_ui(self) -> None:
+        top_bar = self._create_card(self.root, bg=COLORS["panel"], border=COLORS["border"])
+        top_bar.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 12))
+        top_bar.grid_columnconfigure(1, weight=1)
+
+        title_frame = tk.Frame(top_bar, bg=COLORS["panel"])
+        title_frame.grid(row=0, column=0, sticky="w", padx=20, pady=18)
+        tk.Label(title_frame, text="Live Engagement Monitor", bg=COLORS["panel"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 22)).pack(anchor="w")
         tk.Label(
-            card,
-            text=eyebrow.upper(),
-            font=("Segoe UI", 9, "bold"),
-            bg=background,
-            fg=accent,
-            padx=10,
-            pady=4,
-        ).grid(row=0, column=0, sticky="w")
-        value_var = tk.StringVar(value="0%")
-        detail_var = tk.StringVar(value=subtitle)
-        tk.Label(
-            card,
-            text=title,
-            font=("Segoe UI", 18, "bold"),
-            bg=background,
-            fg=TEXT_PRIMARY,
-        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
-        tk.Label(
-            card,
-            textvariable=value_var,
-            font=("Segoe UI", 30, "bold"),
-            bg=background,
-            fg=TEXT_PRIMARY,
-        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(18, 0))
-        tk.Label(
-            card,
-            textvariable=detail_var,
+            title_frame,
+            text="Primary engagement decision with live contextual affect signals.",
+            bg=COLORS["panel"],
+            fg=COLORS["text_soft"],
             font=("Segoe UI", 10),
-            bg=background,
-            fg=TEXT_MUTED,
-            wraplength=self.metric_wrap,
+        ).pack(anchor="w", pady=(4, 0))
+
+        chip_frame = tk.Frame(top_bar, bg=COLORS["panel"])
+        chip_frame.grid(row=0, column=1, sticky="w", padx=(0, 20), pady=18)
+        self.status_chip = self._create_chip(chip_frame, self.status_var.get(), COLORS["panel_soft"])
+        self.status_chip.pack(side="left", padx=(0, 8))
+        self._create_chip(chip_frame, self.device_label, COLORS["panel_alt"]).pack(side="left", padx=(0, 8))
+        self._create_chip(chip_frame, self.model_variant.title(), COLORS["panel_alt"]).pack(side="left", padx=(0, 8))
+        self._create_chip(chip_frame, f"{self.head_count} head{'s' if self.head_count != 1 else ''}", COLORS["panel_alt"]).pack(side="left", padx=(0, 8))
+        self._create_chip(chip_frame, f"Seq {self.seq_len}", COLORS["panel_alt"]).pack(side="left")
+
+        button_frame = tk.Frame(top_bar, bg=COLORS["panel"])
+        button_frame.grid(row=0, column=2, sticky="e", padx=20, pady=18)
+        self.start_button = self._create_button(button_frame, "Start Camera", self.start, COLORS["green"])
+        self.stop_button = self._create_button(button_frame, "Stop", self.stop, COLORS["panel_alt"])
+        self.start_button.pack(side="left", padx=(0, 10))
+        self.stop_button.pack(side="left")
+        self.stop_button.configure(state="disabled")
+
+        main_area = tk.Frame(self.root, bg=COLORS["bg"])
+        main_area.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        main_area.grid_anchor("nw")
+        main_area.grid_columnconfigure(0, weight=0, minsize=CAMERA_PANEL_WIDTH)
+        main_area.grid_columnconfigure(1, weight=0, minsize=ENGAGEMENT_PANEL_WIDTH)
+        main_area.grid_rowconfigure(0, weight=1)
+
+        preview_card = self._create_card(main_area, bg=COLORS["panel"], border=COLORS["border"])
+        preview_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        preview_card.configure(width=CAMERA_PANEL_WIDTH)
+        preview_card.grid_rowconfigure(1, weight=1)
+        preview_card.grid_columnconfigure(0, weight=1)
+
+        preview_header = tk.Frame(preview_card, bg=COLORS["panel"])
+        preview_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 12))
+        preview_header.grid_columnconfigure(0, weight=1)
+        tk.Label(preview_header, text="Camera Feed", bg=COLORS["panel"], fg=COLORS["text"], font=("Segoe UI Semibold", 14)).grid(row=0, column=0, sticky="w")
+        self.preview_badge = self._create_chip(preview_header, self.preview_badge_var.get(), COLORS["panel_soft"])
+        self.preview_badge.grid(row=0, column=1, sticky="e")
+
+        preview_stage = tk.Frame(preview_card, bg=COLORS["preview"])
+        preview_stage.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 12))
+        preview_stage.configure(height=PREVIEW_STAGE_HEIGHT)
+        preview_stage.grid_propagate(False)
+        preview_stage.grid_rowconfigure(0, weight=1)
+        preview_stage.grid_columnconfigure(0, weight=1)
+        self.preview_label = tk.Label(
+            preview_stage,
+            text="Camera idle\nStart the camera to begin live monitoring.",
+            bg=COLORS["preview"],
+            fg=COLORS["text_soft"],
+            justify="center",
+            font=("Segoe UI", 16),
+        )
+        self.preview_label.grid(row=0, column=0, sticky="nsew")
+        self.preview_label.bind("<Configure>", self._on_preview_configure)
+
+        self.preview_footer = tk.Label(
+            preview_card,
+            textvariable=self.footer_var,
+            bg=COLORS["panel"],
+            fg=COLORS["text_muted"],
+            anchor="w",
             justify="left",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 12))
+            font=("Segoe UI", 10),
+        )
+        self.preview_footer.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 18))
 
-        slider = tk.Canvas(card, width=self.slider_width, height=80, bg=background, highlightthickness=0)
-        slider.grid(row=3, column=0, columnspan=2, sticky="ew")
-        return {
-            "value_var": value_var,
-            "detail_var": detail_var,
-            "slider": slider,
-            "background": background,
-            "accent": accent,
-        }
+        self.decision_card = self._create_card(main_area, bg=COLORS["panel"], border=COLORS["border"])
+        self.decision_card.grid(row=0, column=1, sticky="nsew")
+        self.decision_card.configure(width=ENGAGEMENT_PANEL_WIDTH)
+        self.decision_card.grid_columnconfigure(0, weight=1)
 
-    def start(self):
+        decision_body = tk.Frame(self.decision_card, bg=COLORS["panel"])
+        decision_body.grid(row=0, column=0, sticky="nsew", padx=22, pady=22)
+        decision_body.grid_columnconfigure(0, weight=1)
+
+        tk.Label(decision_body, text="PRIMARY DECISION", bg=COLORS["panel"], fg=COLORS["text_muted"], font=("Segoe UI Semibold", 9)).grid(row=0, column=0, sticky="w")
+        self.decision_badge = self._create_chip(decision_body, self.status_var.get(), COLORS["panel_soft"])
+        self.decision_badge.grid(row=1, column=0, sticky="w", pady=(12, 16))
+
+        tk.Label(decision_body, textvariable=self.prediction_var, bg=COLORS["panel"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 34)).grid(row=2, column=0, sticky="w")
+        tk.Label(decision_body, textvariable=self.confidence_var, bg=COLORS["panel"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 14)).grid(row=3, column=0, sticky="w", pady=(6, 8))
+        tk.Label(
+            decision_body,
+            textvariable=self.summary_var,
+            bg=COLORS["panel"],
+            fg=COLORS["text_soft"],
+            wraplength=420,
+            justify="left",
+            font=("Segoe UI", 10),
+        ).grid(row=4, column=0, sticky="ew")
+
+        self.primary_meter = tk.Canvas(decision_body, height=32, bg=COLORS["panel"], highlightthickness=0, bd=0)
+        self.primary_meter.grid(row=5, column=0, sticky="ew", pady=(20, 18))
+
+        stat_row = tk.Frame(decision_body, bg=COLORS["panel"])
+        stat_row.grid(row=6, column=0, sticky="ew")
+        stat_row.grid_columnconfigure(0, weight=1)
+        stat_row.grid_columnconfigure(1, weight=1)
+        self.engaged_block = self._create_stat_block(stat_row, "Engaged")
+        self.not_engaged_block = self._create_stat_block(stat_row, "Not Engaged")
+        self.engaged_block["frame"].grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.not_engaged_block["frame"].grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        self.spotlight_card = self._create_card(decision_body, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+        self.spotlight_card.grid(row=7, column=0, sticky="ew", pady=(18, 0))
+        tk.Label(self.spotlight_card, textvariable=self.spotlight_label_var, bg=COLORS["panel_alt"], fg=COLORS["text_muted"], font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=16, pady=(14, 4))
+        self.spotlight_value = tk.Label(self.spotlight_card, textvariable=self.spotlight_value_var, bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 22))
+        self.spotlight_value.pack(anchor="w", padx=16)
+        tk.Label(
+            self.spotlight_card,
+            textvariable=self.spotlight_detail_var,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text_soft"],
+            wraplength=410,
+            justify="left",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", padx=16, pady=(4, 10))
+        self.spotlight_meter = tk.Canvas(self.spotlight_card, height=20, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+        self.spotlight_meter.pack(fill="x", padx=16, pady=(0, 14))
+
+        bottom_band = self._create_card(self.root, bg=COLORS["panel"], border=COLORS["border"])
+        bottom_band.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 18))
+        bottom_band.grid_columnconfigure(0, weight=1)
+
+        bottom_header = tk.Frame(bottom_band, bg=COLORS["panel"])
+        bottom_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 10))
+        bottom_header.grid_columnconfigure(0, weight=1)
+        tk.Label(bottom_header, text="Signal Overview", bg=COLORS["panel"], fg=COLORS["text"], font=("Segoe UI Semibold", 13)).grid(row=0, column=0, sticky="w")
+        tk.Label(bottom_header, textvariable=self.meta_var, bg=COLORS["panel"], fg=COLORS["text_muted"], font=("Segoe UI", 9)).grid(row=0, column=1, sticky="e")
+
+        self.tiles_frame = tk.Frame(bottom_band, bg=COLORS["panel"])
+        self.tiles_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 14))
+        self._build_signal_tiles()
+
+    def _build_signal_tiles(self) -> None:
+        tile_specs = [
+            {"key": "engaged", "label": "Engaged", "accent": HEAD_PALETTES["engagement"]["accent"], "surface": HEAD_PALETTES["engagement"]["surface"]},
+            {"key": "not_engaged", "label": "Not Engaged", "accent": HEAD_PALETTES["not_engaged"]["accent"], "surface": HEAD_PALETTES["not_engaged"]["surface"]},
+        ]
+        for spec in self.secondary_specs:
+            tile_specs.append(
+                {
+                    "key": f"head:{spec['index']}",
+                    "label": spec["label"],
+                    "accent": spec["accent"],
+                    "surface": spec["surface"],
+                    "head_index": spec["index"],
+                }
+            )
+
+        for column, spec in enumerate(tile_specs):
+            self.tiles_frame.grid_columnconfigure(column, weight=1)
+            tile = self._create_card(self.tiles_frame, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+            tile.grid(row=0, column=column, sticky="ew", padx=6)
+            tk.Label(tile, text=spec["label"], bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=14, pady=(14, 4))
+            value = tk.Label(tile, text="50%", bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 24))
+            value.pack(anchor="w", padx=14)
+            detail = tk.Label(tile, text="Standby", bg=COLORS["panel_alt"], fg=COLORS["text_muted"], font=("Segoe UI", 9))
+            detail.pack(anchor="w", padx=14, pady=(2, 10))
+            meter = tk.Canvas(tile, height=16, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+            meter.pack(fill="x", padx=14, pady=(0, 14))
+            self.signal_tiles[spec["key"]] = {
+                "frame": tile,
+                "value": value,
+                "detail": detail,
+                "meter": meter,
+                "accent": spec["accent"],
+                "surface": spec["surface"],
+                "head_index": spec.get("head_index"),
+            }
+
+    def _draw_capsule(self, canvas: tk.Canvas, value: float, accent: str, track: str, text: str | None = None) -> None:
+        canvas.delete("all")
+        width = max(8, canvas.winfo_width() or 220)
+        height = max(8, canvas.winfo_height() or 18)
+        radius = height / 2
+        canvas.create_rectangle(radius, 0, width - radius, height, fill=track, outline=track)
+        canvas.create_oval(0, 0, radius * 2, height, fill=track, outline=track)
+        canvas.create_oval(width - radius * 2, 0, width, height, fill=track, outline=track)
+
+        fill_w = width * max(0.0, min(1.0, value))
+        if fill_w > radius:
+            canvas.create_rectangle(radius, 0, fill_w - radius, height, fill=accent, outline=accent)
+            canvas.create_oval(0, 0, radius * 2, height, fill=accent, outline=accent)
+            canvas.create_oval(fill_w - radius * 2, 0, fill_w, height, fill=accent, outline=accent)
+        elif fill_w > 0:
+            canvas.create_oval(0, 0, fill_w * 2, height, fill=accent, outline=accent)
+
+        if text:
+            canvas.create_text(width / 2, height / 2, text=text, fill=COLORS["text"], font=("Segoe UI Semibold", 9))
+
+    def _draw_primary_meter(self, engaged_score: float, not_engaged_score: float) -> None:
+        canvas = self.primary_meter
+        canvas.delete("all")
+        width = max(16, canvas.winfo_width() or 360)
+        height = max(12, canvas.winfo_height() or 32)
+        radius = height / 2
+        track = COLORS["panel_alt"]
+
+        canvas.create_rectangle(radius, 0, width - radius, height, fill=track, outline=track)
+        canvas.create_oval(0, 0, radius * 2, height, fill=track, outline=track)
+        canvas.create_oval(width - radius * 2, 0, width, height, fill=track, outline=track)
+
+        left_width = width * max(0.0, min(1.0, not_engaged_score))
+        if left_width > 0:
+            fill = HEAD_PALETTES["not_engaged"]["accent"]
+            canvas.create_rectangle(radius, 0, max(radius, left_width), height, fill=fill, outline=fill)
+            canvas.create_oval(0, 0, radius * 2, height, fill=fill, outline=fill)
+        if engaged_score > 0:
+            fill = HEAD_PALETTES["engagement"]["accent"]
+            right_start = width * max(0.0, min(1.0, not_engaged_score))
+            canvas.create_rectangle(max(radius, right_start), 0, width - radius, height, fill=fill, outline=fill)
+            canvas.create_oval(width - radius * 2, 0, width, height, fill=fill, outline=fill)
+        canvas.create_text(
+            width / 2,
+            height / 2,
+            text=f"Not Engaged {not_engaged_score * 100:.0f}%   |   Engaged {engaged_score * 100:.0f}%",
+            fill=COLORS["text"],
+            font=("Segoe UI Semibold", 10),
+        )
+
+    def _engagement_scores(self, output: np.ndarray) -> tuple[float, float, int]:
+        engagement_head = output[self.engagement_head_index]
+        engaged = float(sum(engagement_head[idx] for idx in self.positive_class_indices if idx < len(engagement_head)))
+        not_engaged = float(sum(engagement_head[idx] for idx in self.negative_class_indices if idx < len(engagement_head)))
+        dominant_level = int(np.argmax(engagement_head))
+        return engaged, not_engaged, dominant_level
+
+    def _strongest_secondary_signal(self, output: np.ndarray) -> dict[str, Any] | None:
+        best: dict[str, Any] | None = None
+        for spec in self.secondary_specs:
+            head = output[spec["index"]]
+            elevated = float(sum(head[idx] for idx in self.positive_class_indices if idx < len(head)))
+            dominant_level = int(np.argmax(head))
+            candidate = {
+                "spec": spec,
+                "elevated": elevated,
+                "dominant_level": dominant_level,
+                "probabilities": head,
+            }
+            if best is None or elevated > best["elevated"]:
+                best = candidate
+        return best
+
+    def _apply_state_palette(self, state: str) -> None:
+        style = STATE_STYLES[state]
+        accent = style["accent"]
+        surface = style["surface"]
+        self.status_chip.configure(text=self.status_var.get(), bg=surface, fg=accent)
+        self.preview_badge.configure(text=self.preview_badge_var.get(), bg=surface, fg=accent)
+        self.decision_badge.configure(text=self.status_var.get(), bg=surface, fg=accent)
+        self.decision_card.configure(highlightbackground=mix_color(accent, COLORS["border"], 0.25))
+
+    def _set_state(
+        self,
+        state: str,
+        headline: str,
+        confidence: str,
+        summary: str,
+        footer: str,
+        preview_badge: str | None = None,
+    ) -> None:
+        self.state = state
+        self.status_var.set(STATE_STYLES[state]["badge"])
+        self.preview_badge_var.set(preview_badge or STATE_STYLES[state]["badge"])
+        self.prediction_var.set(headline)
+        self.confidence_var.set(confidence)
+        self.summary_var.set(summary)
+        self.footer_var.set(footer)
+        self._apply_state_palette(state)
+
+    def _binary_detail(self, kind: str, score: float, dominant_level: int) -> str:
+        level = AFFECT_LEVELS[min(dominant_level, len(AFFECT_LEVELS) - 1)]
+        if kind == "engaged":
+            return "High + Very High band" if score >= 0.55 else f"Lead level: {level}"
+        return "Very Low + Low band" if score >= 0.55 else f"Lead level: {level}"
+
+    def _spotlight_copy(self, signal: dict[str, Any] | None) -> tuple[str, str, str, float, str]:
+        if not self.secondary_specs:
+            return "Secondary Spotlight", "Engagement-only model active", "No secondary affect heads are available in this export.", 0.0, COLORS["text_soft"]
+        if signal is None or signal["elevated"] < SPOTLIGHT_THRESHOLD:
+            return "Secondary Spotlight", "Secondary signals stable", "No non-engagement head is above the promotion threshold.", 0.0, COLORS["text_soft"]
+        spec = signal["spec"]
+        level = AFFECT_LEVELS[min(signal["dominant_level"], len(AFFECT_LEVELS) - 1)]
+        detail = f"{signal['elevated'] * 100:.0f}% in the high band | Dominant level {level}"
+        return "Secondary Spotlight", f"{spec['label']} rising", detail, float(signal["elevated"]), spec["accent"]
+
+    def _update_spotlight(self, signal: dict[str, Any] | None) -> None:
+        label, value, detail, meter_value, accent = self._spotlight_copy(signal)
+        self.spotlight_label_var.set(label)
+        self.spotlight_value_var.set(value)
+        self.spotlight_detail_var.set(detail)
+        self.spotlight_value.configure(fg=accent if meter_value > 0 else COLORS["text"])
+        self.spotlight_card.configure(highlightbackground=mix_color(accent, COLORS["border_soft"], 0.35))
+        self._draw_capsule(self.spotlight_meter, meter_value, accent, COLORS["panel_soft"])
+
+    def _update_signal_tiles(self, output: np.ndarray, active_signal: dict[str, Any] | None) -> None:
+        engaged, not_engaged, dominant_level = self._engagement_scores(output)
+        engaged_tile = self.signal_tiles.get("engaged")
+        not_engaged_tile = self.signal_tiles.get("not_engaged")
+        for tile, score, detail in (
+            (engaged_tile, engaged, self._binary_detail("engaged", engaged, dominant_level)),
+            (not_engaged_tile, not_engaged, self._binary_detail("not_engaged", not_engaged, dominant_level)),
+        ):
+            if tile is None:
+                continue
+            accent = tile["accent"]
+            tile["value"].configure(text=f"{score * 100:.0f}%")
+            tile["detail"].configure(text=detail)
+            tile["frame"].configure(highlightbackground=mix_color(accent, COLORS["border_soft"], 0.35))
+            self._draw_capsule(tile["meter"], score, accent, tile["surface"])
+
+        active_key = None
+        if active_signal is not None and active_signal["elevated"] >= SPOTLIGHT_THRESHOLD:
+            active_key = f"head:{active_signal['spec']['index']}"
+        for spec in self.secondary_specs:
+            tile = self.signal_tiles.get(f"head:{spec['index']}")
+            if tile is None:
+                continue
+            head = output[spec["index"]]
+            elevated = float(sum(head[idx] for idx in self.positive_class_indices if idx < len(head)))
+            dominant = AFFECT_LEVELS[min(int(np.argmax(head)), len(AFFECT_LEVELS) - 1)]
+            tile["value"].configure(text=f"{elevated * 100:.0f}%")
+            tile["detail"].configure(text=f"{dominant} tendency")
+            border = spec["accent"] if active_key == f"head:{spec['index']}" else mix_color(spec["accent"], COLORS["border_soft"], 0.35)
+            tile["frame"].configure(highlightbackground=border)
+            self._draw_capsule(tile["meter"], elevated, spec["accent"], spec["surface"])
+
+    def _update_primary_view(self, output: np.ndarray) -> None:
+        engaged, not_engaged, dominant_level = self._engagement_scores(output)
+        self.engaged_block["value"].configure(text=f"{engaged * 100:.0f}%")
+        self.engaged_block["detail"].configure(text=self._binary_detail("engaged", engaged, dominant_level))
+        self.not_engaged_block["value"].configure(text=f"{not_engaged * 100:.0f}%")
+        self.not_engaged_block["detail"].configure(text=self._binary_detail("not_engaged", not_engaged, dominant_level))
+        self._draw_primary_meter(engaged, not_engaged)
+
+        primary_label = "Engaged" if engaged >= not_engaged else "Not Engaged"
+        primary_confidence = max(engaged, not_engaged)
+        active_signal = self._strongest_secondary_signal(output)
+        spotlight_active = active_signal is not None and active_signal["elevated"] >= SPOTLIGHT_THRESHOLD
+
+        if primary_confidence < PRIMARY_CONFIDENCE_THRESHOLD and spotlight_active:
+            headline = "Mixed Signals"
+            summary = f"Engagement is close while {active_signal['spec']['label'].lower()} is elevated."
+            state = "live_mixed"
+        elif primary_label == "Engaged":
+            headline = "Engaged"
+            summary = "High and very high engagement are leading the window."
+            if spotlight_active:
+                summary = f"High engagement leads while {active_signal['spec']['label'].lower()} is also elevated."
+            state = "live_engaged"
+        else:
+            headline = "Not Engaged"
+            summary = "Low and very low engagement are leading the window."
+            if spotlight_active:
+                summary = f"Low engagement leads with {active_signal['spec']['label'].lower()} elevated in the background."
+            state = "live_not_engaged"
+
+        confidence = f"{primary_confidence * 100:.0f}% window confidence | Dominant level {AFFECT_LEVELS[dominant_level]}"
+        footer = "Live monitoring active. Secondary tiles refresh from the current frame window."
+        self._set_state(state, headline, confidence, summary, footer, preview_badge="Live")
+        self._update_spotlight(active_signal)
+        self._update_signal_tiles(output, active_signal)
+
+    def _draw_preview_placeholder(self) -> None:
+        self.preview_label.configure(
+            image="",
+            text="Camera idle\nStart the camera to begin live monitoring.",
+            fg=COLORS["text_soft"],
+        )
+        self.preview_photo = None
+
+    def _update_preview(self, frame: np.ndarray | None) -> None:
+        if frame is None:
+            self._draw_preview_placeholder()
+            return
+
+        width = max(320, self.preview_label.winfo_width())
+        height = max(240, self.preview_label.winfo_height())
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb)
+        image.thumbnail((width, height), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (width, height), COLORS["preview"])
+        x_pos = (width - image.width) // 2
+        y_pos = (height - image.height) // 2
+        canvas.paste(image, (x_pos, y_pos))
+        photo = ImageTk.PhotoImage(canvas)
+        self.preview_photo = photo
+        self.preview_label.configure(image=photo, text="")
+
+    def _on_preview_configure(self, _event) -> None:
+        if self.last_frame is None:
+            self._draw_preview_placeholder()
+        else:
+            self._update_preview(self.last_frame)
+
+    def start(self) -> None:
         if self.running:
             return
-
-        cap = open_camera()
-        if cap is None:
-            messagebox.showerror("Webcam Error", "Could not open the webcam.")
+        self.capture = open_camera(0)
+        if not self.capture or not self.capture.isOpened():
+            self._set_error_view("Unable to open the webcam.")
             return
 
-        self.cap = cap
         self.running = True
-        self.window.clear()
-        self.ema_output = self._neutral_output()
-        self.display_output = self.ema_output.copy()
-        self.last_render_tick = time.perf_counter()
-        self.last_inference_tick = 0.0
-        self.latest_frame_bgr = None
-        self.capture_count = 0
-        self.status_var.set("Warming Up")
-        self.prediction_var.set("Reading the room")
-        self.summary_var.set(f"Collecting {SEQ_LEN} frames before the first decision.")
-        self.fps_var.set("Preview 0.0 FPS")
-        self.preview_badge_var.set("Connecting")
-        self.preview_footer_var.set(
-            f"Camera opened. Building a {SEQ_LEN}-frame temporal window for smoother inference."
-        )
-        self._set_binary_values(0.5, 0.5)
-        self._set_affect_values(None)
-        self._apply_state_palette("warmup")
-        self.capture_thread = threading.Thread(target=self._capture_loop, name="webcam-capture", daemon=True)
-        self.capture_thread.start()
-        self._update_loop()
-
-    def stop(self):
-        self.running = False
-        if self.capture_thread is not None and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=0.5)
-        self.capture_thread = None
-        with self.state_lock:
-            self.window.clear()
-            self.latest_frame_bgr = None
-        if self.cap is not None:
-            self.cap.release()
-        self.cap = None
-        self.status_var.set("Idle")
-        self.prediction_var.set("Awaiting webcam feed")
-        self.summary_var.set("Start the camera to light up the dashboard.")
-        self.fps_var.set("Preview 0.0 FPS")
-        self.preview_badge_var.set("Offline")
-        self.preview_footer_var.set(self._idle_footer_text())
-        self.ema_output = self._neutral_output()
+        self.session_token += 1
+        self.frame_buffer.clear()
+        self.last_frame = None
+        self.pending_output = None
+        self.pending_error = None
         self.display_output = self._neutral_output()
-        self._set_binary_values(0.0, 0.0)
-        self._set_affect_values(None)
-        self._apply_state_palette("idle")
-        self.preview_canvas.delete("all")
-        self.preview_item = None
-        self._set_preview_placeholder()
+        self.target_output = self._neutral_output()
+        self.last_prediction_time = 0.0
 
-    def on_close(self):
+        self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
+        self._set_state(
+            "warming_up",
+            "Warming Up",
+            "Collecting live frame context",
+            f"Buffering {self.seq_len} frames before the first decision.",
+            f"Frame buffer 0/{self.seq_len}",
+            preview_badge="Warming",
+        )
+        self._update_spotlight(None)
+        self._update_signal_tiles(self.display_output, None)
+        self._schedule_capture()
+        self._schedule_ui()
+
+    def stop(self) -> None:
+        self.running = False
+        self.session_token += 1
+        if self.capture_after_id:
+            self.root.after_cancel(self.capture_after_id)
+            self.capture_after_id = None
+        if self.ui_after_id:
+            self.root.after_cancel(self.ui_after_id)
+            self.ui_after_id = None
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
+        self.frame_buffer.clear()
+        self.inference_busy = False
+        self.start_button.configure(state="normal")
+        self.stop_button.configure(state="disabled", bg=COLORS["panel_alt"], fg=COLORS["text"])
+        self.display_output = self._neutral_output()
+        self.target_output = self._neutral_output()
+        self._set_state("idle", "Camera Idle", "Waiting for live input", self._idle_summary(), self._idle_footer(), preview_badge="Idle")
+        self._update_spotlight(None)
+        self._update_signal_tiles(self.display_output, None)
+        self.last_frame = None
+        self._draw_preview_placeholder()
+
+    def _set_error_view(self, message: str) -> None:
+        self.start_button.configure(state="normal")
+        self.stop_button.configure(state="disabled", bg=COLORS["panel_alt"], fg=COLORS["text"])
+        self._set_state("error", "Runtime Error", message, "Check camera access or the ONNX runtime configuration.", message, preview_badge="Error")
+        self.preview_label.configure(image="", text="Runtime error\nSee the status panel for details.", fg=COLORS["red"])
+
+    def _schedule_capture(self) -> None:
+        if not self.closing:
+            self.capture_after_id = self.root.after(15, self._capture_loop)
+
+    def _schedule_ui(self) -> None:
+        if not self.closing:
+            self.ui_after_id = self.root.after(50, self._update_loop)
+
+    def _run_inference(self, frames: list[np.ndarray], token: int) -> None:
+        try:
+            output = predict_output(
+                session=self.session,
+                input_name=self.input_name,
+                output_name=self.output_name,
+                frames=frames,
+                img_size=self.img_size,
+                class_count=self.class_count,
+                head_count=self.head_count,
+            )
+            with self.output_lock:
+                if token == self.session_token:
+                    self.pending_output = output
+        except Exception as exc:
+            with self.output_lock:
+                if token == self.session_token:
+                    self.pending_error = str(exc)
+        finally:
+            self.inference_busy = False
+
+    def _capture_loop(self) -> None:
+        if not self.running or self.capture is None:
+            return
+
+        ok, frame = self.capture.read()
+        if not ok:
+            self.stop()
+            self._set_error_view("The webcam stopped responding.")
+            return
+
+        self.last_frame = frame
+        self.frame_buffer.append(frame.copy())
+        self._update_preview(frame)
+
+        buffered = len(self.frame_buffer)
+        if buffered < self.seq_len:
+            self._set_state(
+                "warming_up",
+                "Warming Up",
+                "Collecting live frame context",
+                f"Buffering {self.seq_len} frames before the first decision.",
+                f"Frame buffer {buffered}/{self.seq_len}",
+                preview_badge="Warming",
+            )
+        elif not self.inference_busy and time.time() - self.last_prediction_time >= INFERENCE_INTERVAL_SEC:
+            self.inference_busy = True
+            self.last_prediction_time = time.time()
+            threading.Thread(target=self._run_inference, args=(list(self.frame_buffer), self.session_token), daemon=True).start()
+
+        self._schedule_capture()
+
+    def _update_loop(self) -> None:
+        if not self.running:
+            return
+
+        pending_output = None
+        pending_error = None
+        with self.output_lock:
+            if self.pending_output is not None:
+                pending_output = self.pending_output.copy()
+                self.pending_output = None
+            if self.pending_error is not None:
+                pending_error = self.pending_error
+                self.pending_error = None
+
+        if pending_error:
+            self.stop()
+            self._set_error_view(pending_error)
+            return
+
+        if pending_output is not None:
+            self.target_output = pending_output
+
+        if self.target_output is not None and len(self.frame_buffer) >= self.seq_len:
+            self.display_output = ((1.0 - DISPLAY_BLEND) * self.display_output + DISPLAY_BLEND * self.target_output).astype(np.float32)
+            self._update_primary_view(self.display_output)
+
+        self._schedule_ui()
+
+    def on_close(self) -> None:
+        self.closing = True
         self.stop()
         self.root.destroy()
 
-    def _engagement_probs(self, model_output: np.ndarray) -> np.ndarray:
-        if model_output.ndim == 2:
-            return model_output[0]
-        return model_output
 
-    def _binary_scores(self, model_output: np.ndarray):
-        probs = self._engagement_probs(model_output)
-        engaged = float(probs[2] + probs[3])
-        not_engaged = float(probs[0] + probs[1])
-        total = max(engaged + not_engaged, 1e-6)
-        return engaged / total, not_engaged / total
-
-    def _confidence_copy(self, key: str, value: float) -> str:
-        if key == "engaged":
-            if value >= 0.80:
-                return "The latest sequence shows a strong, stable focus signal."
-            if value >= 0.60:
-                return "Attention is leading and holding above the midpoint."
-            if value >= 0.40:
-                return "Focus is present, but it is still fluctuating."
-            return "Low focus signal right now across the recent window."
-        if value >= 0.80:
-            return "Attention drift is dominating the recent sequence."
-        if value >= 0.60:
-            return "The model sees clear signs of low engagement."
-        if value >= 0.40:
-            return "Attention drift is rising, but not fully dominant."
-        return "Low disengagement signal right now across the recent window."
-
-    def _dominant_affect(self, model_output: np.ndarray) -> tuple[str, float] | None:
-        if not self.is_multiaffect:
-            return None
-        strongest = None
-        for _key, head_idx, title, _eyebrow, _subtitle in AFFECT_CARD_SPECS:
-            head_probs = model_output[head_idx]
-            elevated = float(head_probs[2] + head_probs[3])
-            if strongest is None or elevated > strongest[1]:
-                strongest = (title, elevated)
-        return strongest
-
-    def _affect_copy(self, title: str, elevated: float, dominant_level: str) -> str:
-        if elevated >= 0.80:
-            return f"{title} is running high right now. Dominant level: {dominant_level}."
-        if elevated >= 0.55:
-            return f"{title} is noticeably elevated. Dominant level: {dominant_level}."
-        if elevated >= 0.35:
-            return f"{title} is present but still moderate. Dominant level: {dominant_level}."
-        return f"{title} remains relatively low in the latest window. Dominant level: {dominant_level}."
-
-    def _live_summary(self, pred_label: str, pred_conf: float, model_output: np.ndarray) -> str:
-        if pred_conf >= 0.85:
-            base = f"{pred_label} is leading decisively in the current temporal window."
-        elif pred_conf >= 0.65:
-            base = f"{pred_label} is ahead, with moderate stability across recent frames."
-        else:
-            base = "The decision is still soft, so read it as a trend instead of a hard state."
-
-        dominant_affect = self._dominant_affect(model_output)
-        if dominant_affect is None:
-            return base
-        label, elevated = dominant_affect
-        if elevated < 0.35:
-            return f"{base} Secondary affect signals stay fairly contained."
-        return f"{base} Strongest secondary signal: {label.lower()} at {elevated * 100:.0f}%."
-
-    def _apply_state_palette(self, state: str):
-        if self.status_chip is None or self.preview_badge is None:
-            return
-
-        if state == "engaged":
-            chip_bg = mix_color(ENGAGED_ACCENT, "#FFFFFF", 0.60)
-            badge_bg = ENGAGED_ACCENT
-        elif state == "not_engaged":
-            chip_bg = mix_color(NOT_ENGAGED_ACCENT, "#FFFFFF", 0.52)
-            badge_bg = NOT_ENGAGED_ACCENT
-        elif state == "warmup":
-            chip_bg = mix_color(BUTTON_YELLOW, "#FFFFFF", 0.45)
-            badge_bg = "#F7D46A"
-        else:
-            chip_bg = "#FFFDF5"
-            badge_bg = "#FAE393"
-
-        self.status_chip.configure(bg=chip_bg, fg=TEXT_PRIMARY)
-        self.preview_badge.configure(bg=badge_bg, fg=TEXT_PRIMARY)
-
-    def _draw_capsule(self, canvas: tk.Canvas, x0: int, y0: int, x1: int, y1: int, fill: str, outline: str):
-        radius = max(1, min((y1 - y0) // 2, (x1 - x0) // 2))
-        canvas.create_rectangle(x0 + radius, y0, x1 - radius, y1, fill=fill, outline=outline, width=1)
-        canvas.create_oval(x0, y0, x0 + 2 * radius, y1, fill=fill, outline=outline, width=1)
-        canvas.create_oval(x1 - 2 * radius, y0, x1, y1, fill=fill, outline=outline, width=1)
-
-    def _set_preview_placeholder(self):
-        center_x = self.preview_width // 2
-        center_y = self.preview_height // 2
-        self.preview_canvas.create_text(
-            center_x,
-            center_y,
-            text="Webcam preview",
-            fill="#E7EEFF",
-            font=("Segoe UI", 18, "bold"),
-            tags="placeholder",
-        )
-        self.preview_canvas.create_text(
-            center_x,
-            center_y + 32,
-            text="Press Start Webcam to begin realtime inference",
-            fill="#9CA9C8",
-            font=("Segoe UI", 10),
-            tags="placeholder_hint",
-        )
-
-    def _draw_slider(self, canvas: tk.Canvas, value: float, accent: str, background: str):
-        canvas.delete("all")
-        width = int(canvas.cget("width"))
-        height = int(canvas.cget("height"))
-        pad_x = 28
-        track_height = 20
-        radius = track_height // 2
-        y0 = height - 32
-        y1 = y0 + track_height
-        x0 = pad_x
-        x1 = width - pad_x
-        track_width = x1 - x0
-        value = max(0.0, min(1.0, value))
-        fill_x = x0 + int(track_width * value)
-        accent_glow = mix_color(accent, "#FFFFFF", 0.35)
-
-        self._draw_capsule(canvas, x0, y0 + 3, x1, y1 + 3, TRACK_SHADOW, TRACK_SHADOW)
-        self._draw_capsule(canvas, x0, y0, x1, y1, TRACK_COLOR, TRACK_COLOR)
-
-        if fill_x > x0:
-            fill_right = max(fill_x, x0 + 2 * radius)
-            self._draw_capsule(canvas, x0, y0, fill_right, y1, accent, accent)
-            highlight_y0 = y0 + 3
-            highlight_y1 = highlight_y0 + 6
-            if highlight_y1 < y1:
-                self._draw_capsule(
-                    canvas,
-                    x0 + 4,
-                    highlight_y0,
-                    max(x0 + 10, fill_right - 4),
-                    highlight_y1,
-                    accent_glow,
-                    accent_glow,
-                )
-
-        knob_x = x0 + int(track_width * value)
-        knob_radius = 14
-        canvas.create_oval(
-            knob_x - knob_radius,
-            (y0 + y1) // 2 - knob_radius,
-            knob_x + knob_radius,
-            (y0 + y1) // 2 + knob_radius,
-            fill=background,
-            outline=accent,
-            width=4,
-        )
-        canvas.create_oval(
-            knob_x - 5,
-            (y0 + y1) // 2 - 5,
-            knob_x + 5,
-            (y0 + y1) // 2 + 5,
-            fill=accent,
-            outline=accent,
-        )
-
-        bubble_text = f"{int(round(value * 100.0))}%"
-        bubble_width = 62
-        bubble_height = 30
-        bubble_x0 = max(x0, min(knob_x - bubble_width // 2, x1 - bubble_width))
-        bubble_y0 = 10
-        self._draw_capsule(
-            canvas,
-            bubble_x0,
-            bubble_y0,
-            bubble_x0 + bubble_width,
-            bubble_y0 + bubble_height,
-            accent,
-            accent,
-        )
-        canvas.create_text(
-            bubble_x0 + bubble_width // 2,
-            bubble_y0 + bubble_height // 2,
-            text=bubble_text,
-            fill=TEXT_PRIMARY,
-            font=("Segoe UI", 9, "bold"),
-        )
-
-    def _set_binary_values(self, engaged: float, not_engaged: float):
-        values = {
-            "engaged": engaged,
-            "not_engaged": not_engaged,
-        }
-        for key, value in values.items():
-            widget = self.metric_widgets[key]
-            percent = int(round(value * 100.0))
-            widget["value_var"].set(f"{percent}%")
-            widget["detail_var"].set(self._confidence_copy(key, value))
-            self._draw_slider(widget["slider"], value, widget["accent"], widget["background"])
-
-    def _set_affect_values(self, model_output: np.ndarray | None):
-        if not self.is_multiaffect:
-            return
-        for key, head_idx, title, _eyebrow, subtitle in AFFECT_CARD_SPECS:
-            widget = self.metric_widgets[key]
-            if model_output is None:
-                widget["value_var"].set("0%")
-                widget["detail_var"].set(subtitle)
-                self._draw_slider(widget["slider"], 0.0, widget["accent"], widget["background"])
-                continue
-            head_probs = model_output[head_idx]
-            elevated = float(head_probs[2] + head_probs[3])
-            dominant_level = ENGAGEMENT_LEVELS[int(np.argmax(head_probs))]
-            widget["value_var"].set(f"{int(round(elevated * 100.0))}%")
-            widget["detail_var"].set(self._affect_copy(title, elevated, dominant_level))
-            self._draw_slider(widget["slider"], elevated, widget["accent"], widget["background"])
-
-    def _update_preview(self, frame_bgr: np.ndarray):
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (self.preview_width, self.preview_height), interpolation=cv2.INTER_LINEAR)
-        image = Image.fromarray(resized)
-        self.preview_image = ImageTk.PhotoImage(image=image)
-        if self.preview_item is None:
-            self.preview_canvas.delete("all")
-            self.preview_item = self.preview_canvas.create_image(0, 0, image=self.preview_image, anchor="nw")
-        else:
-            self.preview_canvas.itemconfig(self.preview_item, image=self.preview_image)
-
-    def _capture_loop(self):
-        local_window = deque(maxlen=SEQ_LEN)
-        while self.running and self.cap is not None:
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-
-            now = time.perf_counter()
-            with self.state_lock:
-                self.latest_frame_bgr = frame.copy()
-                self.capture_count += 1
-                should_sample = self.capture_count % FRAME_SKIP == 0
-
-            if not should_sample:
-                continue
-
-            local_window.append(preprocess(frame))
-            with self.state_lock:
-                self.window = deque(local_window, maxlen=SEQ_LEN)
-                warming = len(local_window) < SEQ_LEN
-
-            if warming:
-                continue
-
-            if (now - self.last_inference_tick) * 1000.0 < INFERENCE_INTERVAL_MS:
-                continue
-
-            batch = np.expand_dims(np.stack(list(local_window), axis=0), axis=0)
-            model_output = predict_output(batch)
-            with self.state_lock:
-                self.ema_output = EMA_DECAY * self.ema_output + (1.0 - EMA_DECAY) * model_output
-                self.last_inference_tick = now
-
-    def _update_loop(self):
-        if not self.running or self.cap is None:
-            return
-
-        with self.state_lock:
-            frame = None if self.latest_frame_bgr is None else self.latest_frame_bgr.copy()
-            frame_count = len(self.window)
-            target_output = self.ema_output.copy()
-
-        if frame is not None:
-            self._update_preview(frame)
-
-        if frame_count < SEQ_LEN:
-            self.status_var.set("Warming Up")
-            self.prediction_var.set("Reading the room")
-            self.summary_var.set(f"Buffering temporal context: {frame_count}/{SEQ_LEN} frames collected.")
-            self.preview_badge_var.set(f"{frame_count}/{SEQ_LEN} Frames")
-            self.preview_footer_var.set(
-                f"Building the temporal window for a steadier result. Sampling every {FRAME_SKIP} frames."
-            )
-            self._apply_state_palette("warmup")
-        else:
-            self.status_var.set("Live")
-            self.display_output = (1.0 - BAR_SMOOTHING) * self.display_output + BAR_SMOOTHING * target_output
-            engaged, not_engaged = self._binary_scores(self.display_output)
-            pred_label = "Engaged" if engaged >= not_engaged else "Not Engaged"
-            pred_conf = max(engaged, not_engaged)
-            self.prediction_var.set(f"{pred_label} at {pred_conf * 100:.0f}%")
-            self.summary_var.set(self._live_summary(pred_label, pred_conf, self.display_output))
-            self.preview_badge_var.set(pred_label.upper())
-            self.preview_footer_var.set(self._live_footer_text())
-            self._set_binary_values(engaged, not_engaged)
-            self._set_affect_values(self.display_output)
-            self._apply_state_palette("engaged" if pred_label == "Engaged" else "not_engaged")
-
-        now = time.perf_counter()
-        fps = 1.0 / max(now - self.last_render_tick, 1e-6)
-        self.last_render_tick = now
-        self.fps_var.set(f"Preview {fps:.1f} FPS")
-
-        self.root.after(UI_REFRESH_MS, self._update_loop)
-
-
-def main():
+def main() -> None:
+    runtime = load_model()
     root = tk.Tk()
-    style = ttk.Style()
-    if "clam" in style.theme_names():
-        style.theme_use("clam")
-    EngagementApp(root)
+    app = EngagementApp(root, runtime)
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
 
 

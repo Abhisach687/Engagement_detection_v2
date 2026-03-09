@@ -91,6 +91,8 @@ App behavior:
 - Otherwise it falls back to the original engagement-only distilled student.
 - If the required ONNX export is missing, the app tries to export it automatically from the saved PyTorch or TorchScript checkpoint.
 - The GUI shows the active device (`cuda` or `cpu`) and the active model variant.
+- The desktop UI is now a fixed single-screen dashboard sized for laptop monitoring, with a large live preview, a primary engagement decision panel, and a compact bottom signal band.
+- When the multi-affect ONNX sidecar metadata is present, the app derives the secondary affect tiles from `head_names` and promotes the strongest non-engagement signal only when its `High + Very High` band reaches at least `0.55`.
 
 ## Outputs
 - Models and metrics: `models/`
