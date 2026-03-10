@@ -26,10 +26,10 @@ DEFAULT_SEQ_LEN = 30
 DEFAULT_IMG_SIZE = 224
 DEFAULT_NUM_CLASSES = 4
 
-WINDOW_DEFAULT_WIDTH = 1378
-WINDOW_DEFAULT_HEIGHT = 860
-WINDOW_MIN_WIDTH = 960
-WINDOW_MIN_HEIGHT = 640
+WINDOW_MIN_WIDTH = 620
+WINDOW_MIN_HEIGHT = 620
+WINDOW_EDGE_MARGIN = 16
+WINDOW_VERTICAL_MARGIN = 24
 CAMERA_PANEL_WIDTH = 760
 ENGAGEMENT_PANEL_WIDTH = 530
 PREVIEW_STAGE_HEIGHT = 412
@@ -38,6 +38,7 @@ ENGAGEMENT_PANEL_HEIGHT = 532
 PRIMARY_DECISION_BOX_HEIGHT = 260
 STAT_BLOCK_HEIGHT = 96
 SPOTLIGHT_BOX_HEIGHT = 132
+POMODORO_CARD_HEIGHT = 182
 TOP_BAR_STACK_BREAKPOINT = 1240
 MAIN_STACK_BREAKPOINT = 1180
 TILE_MIN_WIDTH = 220
@@ -53,6 +54,14 @@ MIRROR_PREVIEW = True
 CAMERA_READ_FAILURE_PATIENCE = 8
 CAMERA_RECOVERY_DELAY_MS = 180
 INFERENCE_STALE_FRAME_TOLERANCE = 18
+SUMMARY_WINDOWS_MINUTES = (4, 8)
+SUMMARY_MAX_WINDOW_SEC = SUMMARY_WINDOWS_MINUTES[-1] * 60
+POMODORO_TOTAL_MINUTES = 24
+POMODORO_BLOCK_MINUTES = 8
+POMODORO_TOTAL_SECONDS = POMODORO_TOTAL_MINUTES * 60
+POMODORO_BLOCK_SECONDS = POMODORO_BLOCK_MINUTES * 60
+POMODORO_FRAME_SAMPLE_INTERVAL_SEC = 4.0
+POMODORO_FEEDBACK_SOURCE = "pomodoro_checkin"
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -359,7 +368,7 @@ class EngagementApp:
         self.inference_busy = False
         self.active_inference_id: tuple[int, int] | None = None
         self.session_token = 0
-        self.review_dialog: tk.Toplevel | None = None
+        self.checkin_dialog: tk.Toplevel | None = None
         self.frame_counter = 0
         self.capture_failures = 0
 
@@ -371,16 +380,41 @@ class EngagementApp:
         self.output_history: deque[np.ndarray] = deque(maxlen=OUTPUT_HISTORY_WINDOW)
         self.primary_transition = {"current": None, "candidate": None, "count": 0}
         self.spotlight_transition = {"current": None, "candidate": None, "count": 0}
+        self.recent_engagement_samples: deque[tuple[float, float]] = deque()
+        self.session_engagement_total = 0.0
+        self.session_engagement_count = 0
+        self.session_first_sample_time: float | None = None
 
         self.head_specs = self._build_head_specs()
         self.secondary_specs = [spec for spec in self.head_specs if spec["index"] != self.engagement_head_index]
+        self.pomodoro_specs = self._build_pomodoro_specs()
+        self.pomodoro_supported = len(self.pomodoro_specs) == 4
         self.signal_tiles: dict[str, dict[str, Any]] = {}
         self.signal_tile_order: list[str] = []
+        self.summary_blocks: dict[str, dict[str, Any]] = {}
         self.state = "idle"
         self.scroll_canvas: tk.Canvas | None = None
         self.scroll_canvas_window: int | None = None
         self.content_frame: tk.Frame | None = None
         self.layout_after_id: str | None = None
+        self.pomodoro_progress_canvas: tk.Canvas | None = None
+
+        self.pomodoro_active = False
+        self.pomodoro_paused = False
+        self.pomodoro_prompt_pending = False
+        self.pomodoro_completed_blocks = 0
+        self.pomodoro_current_block_index = 0
+        self.pomodoro_remaining_seconds = float(POMODORO_TOTAL_SECONDS)
+        self.pomodoro_block_elapsed_seconds = 0.0
+        self.pomodoro_last_tick_monotonic: float | None = None
+        self.pomodoro_session_start_epoch: float | None = None
+        self.pomodoro_block_start_epoch: float | None = None
+        self.pomodoro_pending_window_end_epoch: float | None = None
+        self.pomodoro_last_frame_sample_at = 0.0
+        self.pomodoro_phase = "idle" if self.pomodoro_supported else "unavailable"
+        self.pomodoro_status_reason = ""
+        self.pomodoro_block_outputs: list[tuple[float, np.ndarray]] = []
+        self.pomodoro_block_frames: list[tuple[float, np.ndarray]] = []
 
         self.status_var = tk.StringVar(value=STATE_STYLES["idle"]["badge"])
         self.preview_badge_var = tk.StringVar(value="Idle")
@@ -394,15 +428,23 @@ class EngagementApp:
         self.spotlight_detail_var = tk.StringVar(value=self._spotlight_idle_detail())
         self.feedback_insight_var = tk.StringVar(value="")
         self.feedback_status_var = tk.StringVar(value="")
+        self.engagement_summary_note_var = tk.StringVar(value=self._idle_engagement_summary_note())
+        self.pomodoro_status_var = tk.StringVar(value="")
+        self.pomodoro_time_var = tk.StringVar(value="")
+        self.pomodoro_block_var = tk.StringVar(value="")
+        self.pomodoro_next_var = tk.StringVar(value="")
+        self.pomodoro_note_var = tk.StringVar(value="")
 
         self._set_initial_window()
         self._build_root_scaffold()
         self._build_ui()
         self._refresh_feedback_insight()
+        self._reset_engagement_summary()
+        self._reset_pomodoro_state()
         self._update_spotlight(None)
         self._update_signal_tiles(self.display_output, None)
         self._apply_state_palette("idle")
-        self._set_review_button_state()
+        self._sync_control_states()
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.after_idle(self._apply_responsive_layout)
 
@@ -410,6 +452,104 @@ class EngagementApp:
         self.output_history.clear()
         self.primary_transition = {"current": None, "candidate": None, "count": 0}
         self.spotlight_transition = {"current": None, "candidate": None, "count": 0}
+
+    def _idle_engagement_summary_note(self) -> str:
+        return "Engagement averages update from smoothed live predictions once the camera is running."
+
+    def _set_summary_block(self, key: str, value: str, detail: str) -> None:
+        block = self.summary_blocks.get(key)
+        if block is None:
+            return
+        block["value"].configure(text=value)
+        block["detail"].configure(text=detail)
+
+    def _reset_engagement_summary(self) -> None:
+        self.recent_engagement_samples.clear()
+        self.session_engagement_total = 0.0
+        self.session_engagement_count = 0
+        self.session_first_sample_time = None
+        self._set_summary_block("last_4", "--", "Waiting for live predictions")
+        self._set_summary_block("last_8", "--", "Waiting for live predictions")
+        self._set_summary_block("session", "--", "Start the camera to build a session baseline")
+        self.engagement_summary_note_var.set(self._idle_engagement_summary_note())
+
+    def _format_summary_duration(self, seconds: float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        minutes, remainder = divmod(total_seconds, 60)
+        if minutes <= 0:
+            return f"{remainder}s"
+        return f"{minutes}m {remainder:02d}s"
+
+    def _engagement_summary_label(self, score: float) -> str:
+        if score >= 0.7:
+            return "Strong engagement"
+        if score >= 0.55:
+            return "Mostly engaged"
+        if score >= 0.45:
+            return "Mixed engagement"
+        return "Low engagement"
+
+    def _window_average(self, now: float, seconds: int) -> tuple[float | None, float]:
+        cutoff = now - seconds
+        values = [score for timestamp, score in self.recent_engagement_samples if timestamp >= cutoff]
+        if not values:
+            return None, 0.0
+        earliest = next(timestamp for timestamp, _ in self.recent_engagement_samples if timestamp >= cutoff)
+        covered_seconds = max(INFERENCE_INTERVAL_SEC, now - earliest)
+        return float(sum(values) / len(values)), min(float(seconds), covered_seconds)
+
+    def _refresh_engagement_summary(self, now: float | None = None) -> None:
+        now = float(now if now is not None else time.time())
+        four_min_avg, four_min_coverage = self._window_average(now, SUMMARY_WINDOWS_MINUTES[0] * 60)
+        eight_min_avg, eight_min_coverage = self._window_average(now, SUMMARY_WINDOWS_MINUTES[1] * 60)
+
+        if four_min_avg is None:
+            self._set_summary_block("last_4", "--", "Waiting for live predictions")
+        else:
+            detail = (
+                f"Full {SUMMARY_WINDOWS_MINUTES[0]}m window"
+                if four_min_coverage >= SUMMARY_WINDOWS_MINUTES[0] * 60 - 5
+                else f"Using {self._format_summary_duration(four_min_coverage)} of data"
+            )
+            self._set_summary_block("last_4", f"{four_min_avg * 100:.0f}%", detail)
+
+        if eight_min_avg is None:
+            self._set_summary_block("last_8", "--", "Waiting for live predictions")
+        else:
+            detail = (
+                f"Full {SUMMARY_WINDOWS_MINUTES[1]}m window"
+                if eight_min_coverage >= SUMMARY_WINDOWS_MINUTES[1] * 60 - 5
+                else f"Using {self._format_summary_duration(eight_min_coverage)} of data"
+            )
+            self._set_summary_block("last_8", f"{eight_min_avg * 100:.0f}%", detail)
+
+        if self.session_engagement_count <= 0:
+            self._set_summary_block("session", "--", "Start the camera to build a session baseline")
+            self.engagement_summary_note_var.set(self._idle_engagement_summary_note())
+            return
+
+        session_avg = self.session_engagement_total / self.session_engagement_count
+        live_seconds = 0.0 if self.session_first_sample_time is None else max(INFERENCE_INTERVAL_SEC, now - self.session_first_sample_time)
+        self._set_summary_block("session", f"{session_avg * 100:.0f}%", f"{self._engagement_summary_label(session_avg)} trend")
+        trend_note = self._engagement_summary_label(four_min_avg if four_min_avg is not None else session_avg)
+        self.engagement_summary_note_var.set(
+            f"Summary: {trend_note.lower()} over {self._format_summary_duration(live_seconds)} of live predictions."
+        )
+
+    def _record_engagement_sample(self, output: np.ndarray, timestamp: float | None = None) -> None:
+        now = float(timestamp if timestamp is not None else time.time())
+        engaged, _, _ = self._engagement_scores(output)
+        if self.session_first_sample_time is None:
+            self.session_first_sample_time = now
+        self.recent_engagement_samples.append((now, engaged))
+        self.session_engagement_total += engaged
+        self.session_engagement_count += 1
+
+        cutoff = now - SUMMARY_MAX_WINDOW_SEC
+        while self.recent_engagement_samples and self.recent_engagement_samples[0][0] < cutoff:
+            self.recent_engagement_samples.popleft()
+
+        self._refresh_engagement_summary(now)
 
     def _neutral_output(self) -> np.ndarray:
         return np.full((self.head_count, self.class_count), 1.0 / max(1, self.class_count), dtype=np.float32)
@@ -464,6 +604,561 @@ class EngagementApp:
             )
         return specs
 
+    def _build_pomodoro_specs(self) -> list[dict[str, Any]]:
+        ordered_keys = ("engagement", "boredom", "confusion", "frustration")
+        ordered_specs: list[dict[str, Any]] = []
+        for key in ordered_keys:
+            spec = next((item for item in self.head_specs if _normalize_head_name(item["name"]) == key), None)
+            if spec is None:
+                return []
+            ordered_specs.append(spec)
+        return ordered_specs
+
+    def _idle_pomodoro_note(self) -> str:
+        if not self.pomodoro_supported:
+            return "Pomodoro check-ins need the multi-affect model with engagement, boredom, confusion, and frustration heads."
+        return "Start Pomodoro to begin a 24-minute focus block with self-checks every 8 minutes."
+
+    def _format_clock(self, seconds: float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        minutes, remainder = divmod(total_seconds, 60)
+        return f"{minutes:02d}:{remainder:02d}"
+
+    def _reset_pomodoro_block_capture(self, start_epoch: float | None = None) -> None:
+        self.pomodoro_block_outputs.clear()
+        self.pomodoro_block_frames.clear()
+        self.pomodoro_block_start_epoch = start_epoch
+        self.pomodoro_pending_window_end_epoch = None
+        self.pomodoro_last_frame_sample_at = 0.0
+
+    def _reset_pomodoro_state(self, *, phase: str | None = None, reason: str = "") -> None:
+        self.pomodoro_active = False
+        self.pomodoro_paused = False
+        self.pomodoro_prompt_pending = False
+        self.pomodoro_completed_blocks = 0
+        self.pomodoro_current_block_index = 0
+        self.pomodoro_remaining_seconds = float(POMODORO_TOTAL_SECONDS)
+        self.pomodoro_block_elapsed_seconds = 0.0
+        self.pomodoro_last_tick_monotonic = None
+        self.pomodoro_session_start_epoch = None
+        self.pomodoro_status_reason = reason
+        self._reset_pomodoro_block_capture()
+        self.pomodoro_phase = phase or ("idle" if self.pomodoro_supported else "unavailable")
+        self._refresh_pomodoro_ui()
+
+    def _draw_pomodoro_progress(self, completed_blocks: int, current_progress: float, accent: str) -> None:
+        if self.pomodoro_progress_canvas is None:
+            return
+        canvas = self.pomodoro_progress_canvas
+        canvas.delete("all")
+        width = max(24, canvas.winfo_width() or 240)
+        height = max(12, canvas.winfo_height() or 22)
+        gap = 10
+        total_gap = gap * 2
+        block_width = max(24.0, (width - total_gap) / 3.0)
+        track = COLORS["panel_soft"]
+        current_progress = max(0.0, min(1.0, current_progress))
+
+        for index in range(3):
+            x0 = index * (block_width + gap)
+            x1 = x0 + block_width
+            canvas.create_rectangle(x0, 0, x1, height, fill=track, outline=track)
+
+            fill_fraction = 0.0
+            if index < completed_blocks:
+                fill_fraction = 1.0
+            elif index == completed_blocks:
+                fill_fraction = current_progress
+            if fill_fraction > 0:
+                canvas.create_rectangle(x0, 0, x0 + (block_width * fill_fraction), height, fill=accent, outline=accent)
+
+            canvas.create_text(
+                (x0 + x1) / 2,
+                height / 2,
+                text=f"{index + 1}",
+                fill=COLORS["text"],
+                font=("Segoe UI Semibold", 9),
+            )
+
+    def _refresh_pomodoro_ui(self) -> None:
+        if not self.pomodoro_supported:
+            status = "Unavailable"
+            time_text = self._format_clock(POMODORO_TOTAL_SECONDS)
+            block_text = "Needs multi-affect model"
+            next_text = "Engagement-only runtime cannot open 4-head self-checks."
+            note_text = self.pomodoro_status_reason or self._idle_pomodoro_note()
+            accent = COLORS["text_soft"]
+            surface = COLORS["panel_soft"]
+            completed_blocks = 0
+            current_progress = 0.0
+        elif self.pomodoro_phase == "running":
+            block_remaining = max(0.0, POMODORO_BLOCK_SECONDS - self.pomodoro_block_elapsed_seconds)
+            status = "Focus Live"
+            time_text = self._format_clock(self.pomodoro_remaining_seconds)
+            block_text = f"Block {self.pomodoro_current_block_index + 1}/3"
+            next_text = f"Next check-in in {self._format_clock(block_remaining)}"
+            note_text = "Live monitoring stays on while the timer runs. The timer pauses during each self-check."
+            accent = COLORS["blue"]
+            surface = COLORS["blue_soft"]
+            completed_blocks = self.pomodoro_completed_blocks
+            current_progress = self.pomodoro_block_elapsed_seconds / POMODORO_BLOCK_SECONDS
+        elif self.pomodoro_phase == "paused":
+            status = "Check-In"
+            time_text = self._format_clock(self.pomodoro_remaining_seconds)
+            block_text = f"Block {self.pomodoro_current_block_index + 1}/3 complete"
+            next_text = f"Review the last {POMODORO_BLOCK_MINUTES} minutes to continue."
+            note_text = "Answer how engaged, bored, confused, and frustrated you felt. The next block starts after submit or skip."
+            accent = COLORS["amber"]
+            surface = COLORS["amber_soft"]
+            completed_blocks = self.pomodoro_completed_blocks
+            current_progress = 1.0
+        elif self.pomodoro_phase == "complete":
+            status = "Complete"
+            time_text = self._format_clock(0)
+            block_text = "3 blocks finished"
+            next_text = "The 24-minute Pomodoro is complete."
+            note_text = self.pomodoro_status_reason or "Three 8-minute self-check windows were captured for learning."
+            accent = COLORS["green"]
+            surface = COLORS["green_soft"]
+            completed_blocks = 3
+            current_progress = 0.0
+        elif self.pomodoro_phase == "stopped":
+            status = "Stopped"
+            time_text = self._format_clock(self.pomodoro_remaining_seconds)
+            block_text = "Pomodoro ended early"
+            next_text = "Start again for a fresh 24-minute block."
+            note_text = self.pomodoro_status_reason or "Pomodoro stopped before the third self-check."
+            accent = COLORS["red"]
+            surface = COLORS["red_soft"]
+            completed_blocks = 0
+            current_progress = 0.0
+        else:
+            status = "Idle"
+            time_text = self._format_clock(POMODORO_TOTAL_SECONDS)
+            block_text = "Block 1/3"
+            next_text = f"Next check-in in {self._format_clock(POMODORO_BLOCK_SECONDS)}"
+            note_text = self.pomodoro_status_reason or self._idle_pomodoro_note()
+            accent = COLORS["text_soft"]
+            surface = COLORS["panel_soft"]
+            completed_blocks = 0
+            current_progress = 0.0
+
+        self.pomodoro_status_var.set(status)
+        self.pomodoro_time_var.set(time_text)
+        self.pomodoro_block_var.set(block_text)
+        self.pomodoro_next_var.set(next_text)
+        self.pomodoro_note_var.set(note_text)
+
+        if hasattr(self, "pomodoro_chip"):
+            self.pomodoro_chip.configure(text=status, bg=surface, fg=accent)
+        if hasattr(self, "pomodoro_card"):
+            self.pomodoro_card.configure(highlightbackground=mix_color(accent, COLORS["border_soft"], 0.35))
+        self._draw_pomodoro_progress(completed_blocks, current_progress, accent)
+
+    def _sync_control_states(self) -> None:
+        if hasattr(self, "start_button"):
+            if self.running:
+                self.start_button.configure(state="disabled")
+                self.stop_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
+            else:
+                self.start_button.configure(state="normal")
+                self.stop_button.configure(state="disabled", bg=COLORS["panel_alt"], fg=COLORS["text"])
+
+        if not hasattr(self, "start_pomodoro_button"):
+            return
+
+        pomodoro_open = self.pomodoro_active or self.checkin_dialog is not None
+        if self.pomodoro_supported and not pomodoro_open:
+            self.start_pomodoro_button.configure(state="normal", bg=COLORS["blue_soft"], fg=COLORS["blue"])
+        else:
+            self.start_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
+
+        if pomodoro_open:
+            self.stop_pomodoro_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
+        else:
+            self.stop_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
+
+    def _record_pomodoro_frame_sample(self, frame: np.ndarray, timestamp: float | None = None) -> None:
+        if not self.pomodoro_active or self.pomodoro_paused or not self.pomodoro_supported:
+            return
+        now = float(timestamp if timestamp is not None else time.time())
+        if self.pomodoro_last_frame_sample_at and (now - self.pomodoro_last_frame_sample_at) < POMODORO_FRAME_SAMPLE_INTERVAL_SEC:
+            return
+        resized = cv2.resize(frame, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        self.pomodoro_block_frames.append((now, resized.copy()))
+        self.pomodoro_last_frame_sample_at = now
+
+    def _record_pomodoro_output_sample(self, output: np.ndarray, timestamp: float | None = None) -> None:
+        if not self.pomodoro_active or self.pomodoro_paused or not self.pomodoro_supported:
+            return
+        now = float(timestamp if timestamp is not None else time.time())
+        self.pomodoro_block_outputs.append((now, np.asarray(output, dtype=np.float32).copy()))
+
+    def _resample_pomodoro_frames(self) -> list[np.ndarray]:
+        frames = [frame.copy() for _, frame in self.pomodoro_block_frames]
+        if not frames and self.last_frame is not None:
+            resized = cv2.resize(self.last_frame, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            frames = [resized]
+        if not frames:
+            return []
+        if len(frames) >= self.seq_len:
+            indices = np.linspace(0, len(frames) - 1, self.seq_len)
+            return [frames[int(round(index))].copy() for index in indices]
+        padded = [frame.copy() for frame in frames]
+        while len(padded) < self.seq_len:
+            padded.append(padded[-1].copy())
+        return padded
+
+    def _derive_internal_rating(self, output: np.ndarray, corrected_labels: list[int | None], known_mask: list[bool]) -> int:
+        predicted_labels = [int(np.argmax(head)) for head in np.asarray(output, dtype=np.float32)]
+        head_distance = max(1, self.class_count - 1)
+        agreement_scores: list[float] = []
+        for index, predicted in enumerate(predicted_labels):
+            if index >= len(known_mask) or not known_mask[index]:
+                continue
+            corrected = corrected_labels[index]
+            if corrected is None:
+                continue
+            distance = abs(predicted - int(corrected))
+            agreement_scores.append(max(0.0, 1.0 - (distance / head_distance)))
+        if not agreement_scores:
+            return 3
+        agreement = float(sum(agreement_scores) / len(agreement_scores))
+        return max(1, min(5, int(round(1 + (4 * agreement)))))
+
+    def _build_feedback_snapshot(
+        self,
+        *,
+        frames: list[np.ndarray] | None = None,
+        output: np.ndarray | None = None,
+        summary_override: str | None = None,
+        feedback_source: str = "manual_review",
+        window_start_epoch: float | None = None,
+        window_end_epoch: float | None = None,
+        derived_rating: int | None = None,
+    ) -> dict[str, Any] | None:
+        source_frames = list(self.frame_buffer) if frames is None else [frame.copy() for frame in frames]
+        if not source_frames:
+            return None
+        if frames is None and (len(self.frame_buffer) < self.seq_len or len(self.output_history) == 0):
+            return None
+
+        resolved_output = self.display_output.copy().astype(np.float32) if output is None else np.asarray(output, dtype=np.float32).copy()
+        engaged, not_engaged, _ = self._engagement_scores(resolved_output)
+        primary_confidence = max(engaged, not_engaged)
+        spotlight_key = self.spotlight_transition.get("current")
+        if not isinstance(spotlight_key, str) or not spotlight_key.startswith("head:"):
+            spotlight_key = None
+        active_signal = self._signal_for_key(resolved_output, spotlight_key) if spotlight_key else None
+        spotlight_confidence = float(active_signal["elevated"]) if active_signal is not None else 0.0
+        primary_threshold, spotlight_threshold = self._effective_thresholds()
+        return self.feedback_manager.build_review_snapshot(
+            frames=source_frames,
+            output=resolved_output,
+            model_variant=self.model_variant,
+            head_names=self.head_names,
+            class_count=self.class_count,
+            seq_len=self.seq_len,
+            img_size=self.img_size,
+            state=self.state,
+            headline=self.prediction_var.get(),
+            confidence_text=self.confidence_var.get(),
+            summary=summary_override or self.summary_var.get(),
+            primary_confidence=primary_confidence,
+            spotlight_key=spotlight_key,
+            spotlight_confidence=spotlight_confidence,
+            primary_threshold=primary_threshold,
+            spotlight_threshold=spotlight_threshold,
+            feedback_source=feedback_source,
+            window_start_epoch=window_start_epoch,
+            window_end_epoch=window_end_epoch,
+            derived_rating=derived_rating,
+        )
+
+    def _advance_pomodoro_after_checkin(self, status_reason: str) -> None:
+        self.pomodoro_prompt_pending = False
+        self.pomodoro_paused = False
+        self.pomodoro_completed_blocks += 1
+        if self.pomodoro_completed_blocks >= 3:
+            self.pomodoro_active = False
+            self.pomodoro_phase = "complete"
+            self.pomodoro_status_reason = status_reason
+            self.pomodoro_remaining_seconds = 0.0
+            self.pomodoro_block_elapsed_seconds = float(POMODORO_BLOCK_SECONDS)
+            self.pomodoro_current_block_index = 2
+            self._reset_pomodoro_block_capture()
+            self._refresh_pomodoro_ui()
+            self._sync_control_states()
+            return
+
+        self.pomodoro_current_block_index = self.pomodoro_completed_blocks
+        self.pomodoro_block_elapsed_seconds = 0.0
+        self.pomodoro_last_tick_monotonic = time.monotonic()
+        self.pomodoro_phase = "running"
+        self.pomodoro_status_reason = status_reason
+        self._reset_pomodoro_block_capture(time.time())
+        self._refresh_pomodoro_ui()
+        self._sync_control_states()
+
+    def _close_checkin_dialog(self) -> None:
+        if self.checkin_dialog is None:
+            return
+        try:
+            self.checkin_dialog.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            self.checkin_dialog.destroy()
+        except tk.TclError:
+            pass
+        self.checkin_dialog = None
+        self._sync_control_states()
+
+    def _skip_pomodoro_checkin(self) -> None:
+        block_number = self.pomodoro_current_block_index + 1
+        self._close_checkin_dialog()
+        self.feedback_status_var.set(f"Latest: Block {block_number} self-check skipped.")
+        status_reason = (
+            "Pomodoro finished. The last self-check was skipped."
+            if block_number >= 3
+            else f"Block {block_number} skipped. Continue when ready."
+        )
+        self._advance_pomodoro_after_checkin(status_reason)
+
+    def _submit_pomodoro_checkin(self, selections: dict[int, tk.StringVar]) -> None:
+        block_number = self.pomodoro_current_block_index + 1
+        if not self.pomodoro_block_outputs:
+            self._close_checkin_dialog()
+            self.feedback_status_var.set("Latest: Not enough live data was captured for that self-check window.")
+            self._advance_pomodoro_after_checkin(f"Block {block_number} had insufficient live data.")
+            return
+
+        corrected_labels: list[int | None] = [None] * self.head_count
+        known_mask: list[bool] = [False] * self.head_count
+        for spec in self.pomodoro_specs:
+            choice = selections[spec["index"]].get()
+            if choice == "Not sure":
+                corrected_labels[spec["index"]] = None
+                known_mask[spec["index"]] = False
+            else:
+                corrected_labels[spec["index"]] = AFFECT_LEVELS.index(choice)
+                known_mask[spec["index"]] = True
+
+        aggregated_output = np.stack([sample for _, sample in self.pomodoro_block_outputs], axis=0).mean(axis=0).astype(np.float32)
+        derived_rating = self._derive_internal_rating(aggregated_output, corrected_labels, known_mask)
+        summary = f"Pomodoro self-check for block {block_number} covering the last {POMODORO_BLOCK_MINUTES} minutes."
+        snapshot = self._build_feedback_snapshot(
+            frames=self._resample_pomodoro_frames(),
+            output=aggregated_output,
+            summary_override=summary,
+            feedback_source=POMODORO_FEEDBACK_SOURCE,
+            window_start_epoch=self.pomodoro_block_start_epoch,
+            window_end_epoch=self.pomodoro_pending_window_end_epoch or time.time(),
+            derived_rating=derived_rating,
+        )
+        if snapshot is None:
+            self._close_checkin_dialog()
+            self.feedback_status_var.set("Latest: The self-check could not be saved because the Pomodoro window was empty.")
+            self._advance_pomodoro_after_checkin(f"Block {block_number} could not be saved.")
+            return
+
+        self.feedback_manager.submit_feedback(
+            snapshot,
+            rating=derived_rating,
+            corrected_labels=corrected_labels,
+            known_mask=known_mask,
+        )
+        self._refresh_feedback_insight()
+        if self.running and len(self.output_history) > 0:
+            self._update_primary_view(self.display_output)
+        self._close_checkin_dialog()
+        status_reason = (
+            "Pomodoro complete. Three 8-minute windows are ready for learning."
+            if block_number >= 3
+            else f"Block {block_number} saved. Timer resumed for the next focus window."
+        )
+        self._advance_pomodoro_after_checkin(status_reason)
+
+    def _open_pomodoro_checkin(self) -> None:
+        if self.checkin_dialog is not None:
+            self.checkin_dialog.lift()
+            self.checkin_dialog.focus_force()
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Pomodoro Check-In")
+        dialog.configure(bg=COLORS["panel"])
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        self.checkin_dialog = dialog
+        self._sync_control_states()
+
+        container = tk.Frame(dialog, bg=COLORS["panel"])
+        container.pack(fill="both", expand=True, padx=22, pady=22)
+
+        tk.Label(container, text="8-Minute Self-Check", bg=COLORS["panel"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 18)).pack(anchor="w")
+        tk.Label(
+            container,
+            text=f"How engaged, bored, confused, and frustrated did you feel in the last {POMODORO_BLOCK_MINUTES} minutes?",
+            bg=COLORS["panel"],
+            fg=COLORS["text_soft"],
+            justify="left",
+            wraplength=760,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(8, 16))
+
+        choice_values = [*AFFECT_LEVELS, "Not sure"]
+        selections: dict[int, tk.StringVar] = {}
+        for spec in self.pomodoro_specs:
+            row = self._create_card(container, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+            row.pack(fill="x", pady=6)
+            tk.Label(row, text=spec["label"], bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=16, pady=(14, 8))
+            button_row = tk.Frame(row, bg=COLORS["panel_alt"])
+            button_row.pack(fill="x", padx=12, pady=(0, 14))
+            choice_var = tk.StringVar(value="Not sure")
+            selections[spec["index"]] = choice_var
+            for column, choice in enumerate(choice_values):
+                button_row.grid_columnconfigure(column, weight=1)
+                tk.Radiobutton(
+                    button_row,
+                    text=choice,
+                    variable=choice_var,
+                    value=choice,
+                    indicatoron=False,
+                    bg=COLORS["panel_soft"],
+                    fg=COLORS["text"],
+                    activebackground=mix_color(spec["surface"], "#ffffff", 0.06),
+                    activeforeground=COLORS["text"],
+                    selectcolor=spec["surface"],
+                    relief="flat",
+                    bd=0,
+                    padx=10,
+                    pady=10,
+                    font=("Segoe UI Semibold", 9),
+                    highlightthickness=0,
+                    cursor="hand2",
+                ).grid(row=0, column=column, sticky="ew", padx=4)
+
+        action_row = tk.Frame(container, bg=COLORS["panel"])
+        action_row.pack(fill="x", pady=(18, 0))
+        tk.Button(
+            action_row,
+            text="Submit",
+            command=lambda: self._submit_pomodoro_checkin(selections),
+            bg=COLORS["green"],
+            fg=COLORS["text"],
+            activebackground=mix_color(COLORS["green"], "#ffffff", 0.12),
+            activeforeground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+            cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
+            action_row,
+            text="Skip",
+            command=self._skip_pomodoro_checkin,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=mix_color(COLORS["panel_alt"], "#ffffff", 0.08),
+            activeforeground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+            cursor="hand2",
+        ).pack(side="left", padx=(10, 0))
+        tk.Button(
+            action_row,
+            text="Stop Pomodoro",
+            command=self.stop_pomodoro,
+            bg=COLORS["red_soft"],
+            fg=COLORS["red"],
+            activebackground=mix_color(COLORS["red_soft"], "#ffffff", 0.08),
+            activeforeground=COLORS["red"],
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+            cursor="hand2",
+        ).pack(side="right")
+
+        dialog.protocol("WM_DELETE_WINDOW", self._skip_pomodoro_checkin)
+
+    def _update_pomodoro_timer(self) -> None:
+        if not self.pomodoro_active:
+            return
+        if self.pomodoro_paused:
+            self._refresh_pomodoro_ui()
+            return
+
+        now = time.monotonic()
+        if self.pomodoro_last_tick_monotonic is None:
+            self.pomodoro_last_tick_monotonic = now
+        delta = max(0.0, now - self.pomodoro_last_tick_monotonic)
+        self.pomodoro_last_tick_monotonic = now
+        if delta <= 0.0:
+            self._refresh_pomodoro_ui()
+            return
+
+        self.pomodoro_remaining_seconds = max(0.0, self.pomodoro_remaining_seconds - delta)
+        self.pomodoro_block_elapsed_seconds = min(float(POMODORO_BLOCK_SECONDS), self.pomodoro_block_elapsed_seconds + delta)
+        self.pomodoro_phase = "running"
+        if self.pomodoro_block_elapsed_seconds >= POMODORO_BLOCK_SECONDS and not self.pomodoro_prompt_pending:
+            self.pomodoro_paused = True
+            self.pomodoro_prompt_pending = True
+            self.pomodoro_phase = "paused"
+            self.pomodoro_pending_window_end_epoch = time.time()
+            self._refresh_pomodoro_ui()
+            self._open_pomodoro_checkin()
+            return
+
+        self._refresh_pomodoro_ui()
+
+    def start_pomodoro(self) -> None:
+        if not self.pomodoro_supported:
+            self.feedback_status_var.set("Latest: Pomodoro check-ins need the multi-affect model.")
+            self._refresh_pomodoro_ui()
+            return
+        if self.pomodoro_active or self.checkin_dialog is not None:
+            return
+        if not self.running:
+            self.start()
+            if not self.running:
+                return
+
+        self.pomodoro_active = True
+        self.pomodoro_paused = False
+        self.pomodoro_prompt_pending = False
+        self.pomodoro_phase = "running"
+        self.pomodoro_status_reason = ""
+        self.pomodoro_completed_blocks = 0
+        self.pomodoro_current_block_index = 0
+        self.pomodoro_remaining_seconds = float(POMODORO_TOTAL_SECONDS)
+        self.pomodoro_block_elapsed_seconds = 0.0
+        self.pomodoro_session_start_epoch = time.time()
+        self.pomodoro_last_tick_monotonic = time.monotonic()
+        self._reset_pomodoro_block_capture(self.pomodoro_session_start_epoch)
+        self.feedback_status_var.set("Latest: Pomodoro started. The first self-check opens in 8 minutes.")
+        self._refresh_pomodoro_ui()
+        self._sync_control_states()
+
+    def stop_pomodoro(self) -> None:
+        if not (self.pomodoro_active or self.checkin_dialog is not None or self.pomodoro_prompt_pending):
+            return
+        self._close_checkin_dialog()
+        self._reset_pomodoro_state(phase="stopped", reason="Pomodoro stopped. Start again for a fresh 24-minute focus block.")
+        self.feedback_status_var.set("Latest: Pomodoro stopped before completion.")
+        if self.running:
+            self.stop()
+        else:
+            self._sync_control_states()
+
     def _set_initial_window(self) -> None:
         self.root.title("Live Engagement Monitor")
         self.root.configure(bg=COLORS["bg"])
@@ -471,13 +1166,13 @@ class EngagementApp:
 
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        usable_w = max(720, screen_w - 72)
-        usable_h = max(560, screen_h - 96)
+        usable_w = max(WINDOW_MIN_WIDTH, screen_w - (WINDOW_EDGE_MARGIN * 2))
+        usable_h = max(WINDOW_MIN_HEIGHT, screen_h - (WINDOW_VERTICAL_MARGIN * 2))
         self.root.minsize(min(WINDOW_MIN_WIDTH, usable_w), min(WINDOW_MIN_HEIGHT, usable_h))
-        width = min(WINDOW_DEFAULT_WIDTH, usable_w)
-        height = min(WINDOW_DEFAULT_HEIGHT, usable_h)
-        x_pos = max(24, int((screen_w - width) / 2))
-        y_pos = max(24, int((screen_h - height) / 2))
+        width = min(usable_w, max(WINDOW_MIN_WIDTH, int(usable_w / 2)))
+        height = usable_h
+        x_pos = max(0, int((screen_w - usable_w) / 2))
+        y_pos = max(0, int((screen_h - usable_h) / 2))
         self.root.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
@@ -497,9 +1192,10 @@ class EngagementApp:
         self.content_frame = tk.Frame(self.scroll_canvas, bg=COLORS["bg"])
         self.scroll_canvas_window = self.scroll_canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
         self.scroll_canvas.bind("<Configure>", self._on_scroll_canvas_configure)
-        self.scroll_canvas.bind("<MouseWheel>", self._on_mousewheel, add="+")
         self.content_frame.bind("<Configure>", self._on_content_frame_configure)
-        self.content_frame.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._on_mousewheel, add="+")
 
     def _on_scroll_canvas_configure(self, event) -> None:
         if self.scroll_canvas is None or self.scroll_canvas_window is None:
@@ -513,9 +1209,39 @@ class EngagementApp:
         self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
 
     def _on_mousewheel(self, event) -> None:
-        if self.scroll_canvas is None or event.delta == 0:
+        if self.scroll_canvas is None:
             return
-        self.scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
+        if self.checkin_dialog is not None:
+            widget = getattr(event, "widget", None)
+            if widget is not None:
+                try:
+                    if widget.winfo_toplevel() is self.checkin_dialog:
+                        return
+                except tk.TclError:
+                    return
+
+        scroll_region = self.scroll_canvas.bbox("all")
+        if not scroll_region:
+            return
+        if (scroll_region[3] - scroll_region[1]) <= self.scroll_canvas.winfo_height():
+            return
+
+        steps = 0
+        delta = getattr(event, "delta", 0)
+        if delta:
+            steps = -int(delta / 120)
+            if steps == 0:
+                steps = -1 if delta > 0 else 1
+        else:
+            event_num = getattr(event, "num", None)
+            if event_num == 4:
+                steps = -1
+            elif event_num == 5:
+                steps = 1
+
+        if steps == 0:
+            return
+        self.scroll_canvas.yview_scroll(steps, "units")
 
     def _on_root_configure(self, event) -> None:
         if event.widget is self.root:
@@ -538,6 +1264,7 @@ class EngagementApp:
 
         self._layout_top_bar(top_bar_compact)
         self._layout_main_area(main_stacked)
+        self._layout_bottom_header(main_stacked)
         self._layout_signal_tiles(tile_columns)
         self._update_wraplengths(main_stacked)
 
@@ -582,6 +1309,20 @@ class EngagementApp:
         self.preview_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         self.decision_card.grid(row=0, column=1, sticky="nsew")
 
+    def _layout_bottom_header(self, compact: bool) -> None:
+        self.bottom_title_label.grid_forget()
+        self.bottom_meta_label.grid_forget()
+
+        if compact:
+            self.bottom_header.grid_columnconfigure(0, weight=1)
+            self.bottom_title_label.grid(row=0, column=0, sticky="w")
+            self.bottom_meta_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
+            return
+
+        self.bottom_header.grid_columnconfigure(0, weight=1)
+        self.bottom_title_label.grid(row=0, column=0, sticky="w")
+        self.bottom_meta_label.grid(row=0, column=1, sticky="e")
+
     def _layout_signal_tiles(self, columns: int) -> None:
         if not self.signal_tile_order:
             return
@@ -608,7 +1349,10 @@ class EngagementApp:
 
         self.summary_label.configure(wraplength=max(240, decision_width - 72))
         self.spotlight_detail_label.configure(wraplength=max(240, decision_width - 72))
+        self.pomodoro_note_label.configure(wraplength=max(240, decision_width - 72))
         self.preview_footer.configure(wraplength=max(260, preview_width - 40))
+        self.bottom_meta_label.configure(wraplength=max(240, bottom_width - 40))
+        self.engagement_summary_note_label.configure(wraplength=max(260, bottom_width - 40))
         self.feedback_info_label.configure(wraplength=max(260, bottom_width - 40))
         self.feedback_status_label.configure(wraplength=max(260, bottom_width - 40))
         self.preview_stage.configure(height=PREVIEW_STAGE_COMPACT_HEIGHT if main_stacked else PREVIEW_STAGE_HEIGHT)
@@ -655,22 +1399,12 @@ class EngagementApp:
         thresholds = self.feedback_manager.effective_thresholds()
         return float(thresholds["primary"]), float(thresholds["spotlight"])
 
-    def _set_review_button_state(self) -> None:
-        enabled = self.running and len(self.frame_buffer) >= self.seq_len and len(self.output_history) > 0 and self.review_dialog is None
-        if enabled:
-            self.review_button.configure(state="normal", bg=COLORS["blue_soft"], fg=COLORS["blue"])
-        else:
-            self.review_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
-
     def _refresh_feedback_insight(self) -> None:
         insight = self.feedback_manager.current_session_insight()
-        average_rating = insight["average_rating"]
-        avg_text = f"{average_rating:.1f}/5" if insight["review_count"] else "--"
         self.feedback_insight_var.set(
-            "Feedback: "
-            f"{insight['review_count']} reviews | "
+            "Check-ins: "
+            f"{insight['review_count']} logged | "
             f"{insight['trusted_count']} trusted | "
-            f"Avg {avg_text} | "
             f"Primary {insight['primary_threshold'] * 100:.0f}% | "
             f"Spotlight {insight['spotlight_threshold'] * 100:.0f}%"
         )
@@ -728,13 +1462,16 @@ class EngagementApp:
         self.button_frame = tk.Frame(self.top_bar, bg=COLORS["panel"])
         self.button_frame.grid(row=0, column=2, sticky="e", padx=20, pady=18)
         self.start_button = self._create_button(self.button_frame, "Start Camera", self.start, COLORS["green"])
-        self.stop_button = self._create_button(self.button_frame, "Stop", self.stop, COLORS["panel_alt"])
-        self.review_button = self._create_button(self.button_frame, "Rate Prediction", self.open_review_dialog, COLORS["panel_alt"])
+        self.stop_button = self._create_button(self.button_frame, "Stop Camera", self.stop, COLORS["panel_alt"])
+        self.start_pomodoro_button = self._create_button(self.button_frame, "Start Pomodoro", self.start_pomodoro, COLORS["blue_soft"], fg=COLORS["blue"])
+        self.stop_pomodoro_button = self._create_button(self.button_frame, "Stop Pomodoro", self.stop_pomodoro, COLORS["panel_alt"])
         self.start_button.pack(side="left", padx=(0, 10))
         self.stop_button.pack(side="left")
-        self.review_button.pack(side="left", padx=(10, 0))
+        self.start_pomodoro_button.pack(side="left", padx=(10, 0))
+        self.stop_pomodoro_button.pack(side="left", padx=(10, 0))
         self.stop_button.configure(state="disabled")
-        self.review_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
+        self.start_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
+        self.stop_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
 
         self.main_area = tk.Frame(self.content_frame, bg=COLORS["bg"])
         self.main_area.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
@@ -793,6 +1530,7 @@ class EngagementApp:
         self.decision_body.grid_rowconfigure(0, minsize=PRIMARY_DECISION_BOX_HEIGHT)
         self.decision_body.grid_rowconfigure(1, minsize=STAT_BLOCK_HEIGHT)
         self.decision_body.grid_rowconfigure(2, minsize=SPOTLIGHT_BOX_HEIGHT)
+        self.decision_body.grid_rowconfigure(3, minsize=POMODORO_CARD_HEIGHT)
 
         self.primary_box = self._create_card(self.decision_body, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
         self.primary_box.grid(row=0, column=0, sticky="ew")
@@ -853,15 +1591,70 @@ class EngagementApp:
         self.spotlight_meter = tk.Canvas(self.spotlight_card, height=20, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
         self.spotlight_meter.pack(fill="x", padx=16, pady=(0, 12))
 
+        self.pomodoro_card = self._create_card(self.decision_body, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+        self.pomodoro_card.grid(row=3, column=0, sticky="ew", pady=(18, 0))
+        self.pomodoro_card.configure(height=POMODORO_CARD_HEIGHT)
+        self.pomodoro_card.grid_propagate(False)
+        self.pomodoro_card.grid_columnconfigure(0, weight=1)
+
+        pomodoro_header = tk.Frame(self.pomodoro_card, bg=COLORS["panel_alt"])
+        pomodoro_header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 10))
+        pomodoro_header.grid_columnconfigure(0, weight=1)
+        tk.Label(pomodoro_header, text="FOCUS TIMER", bg=COLORS["panel_alt"], fg=COLORS["text_muted"], font=("Segoe UI Semibold", 9)).grid(row=0, column=0, sticky="w")
+        self.pomodoro_chip = self._create_chip(pomodoro_header, "Idle", COLORS["panel_soft"], fg=COLORS["text_soft"])
+        self.pomodoro_chip.grid(row=0, column=1, sticky="e")
+
+        tk.Label(self.pomodoro_card, textvariable=self.pomodoro_time_var, bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 28)).grid(row=1, column=0, sticky="w", padx=16)
+        tk.Label(self.pomodoro_card, textvariable=self.pomodoro_block_var, bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 11)).grid(row=2, column=0, sticky="w", padx=16, pady=(2, 2))
+        tk.Label(self.pomodoro_card, textvariable=self.pomodoro_next_var, bg=COLORS["panel_alt"], fg=COLORS["text_muted"], font=("Segoe UI", 10)).grid(row=3, column=0, sticky="w", padx=16)
+        self.pomodoro_note_label = tk.Label(
+            self.pomodoro_card,
+            textvariable=self.pomodoro_note_var,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text_soft"],
+            justify="left",
+            anchor="w",
+            wraplength=470,
+            font=("Segoe UI", 9),
+        )
+        self.pomodoro_note_label.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 8))
+        self.pomodoro_progress_canvas = tk.Canvas(self.pomodoro_card, height=22, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+        self.pomodoro_progress_canvas.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 14))
+
         self.bottom_band = self._create_card(self.content_frame, bg=COLORS["panel"], border=COLORS["border"])
         self.bottom_band.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 18))
         self.bottom_band.grid_columnconfigure(0, weight=1)
 
-        bottom_header = tk.Frame(self.bottom_band, bg=COLORS["panel"])
-        bottom_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 10))
-        bottom_header.grid_columnconfigure(0, weight=1)
-        tk.Label(bottom_header, text="Signal Overview", bg=COLORS["panel"], fg=COLORS["text"], font=("Segoe UI Semibold", 13)).grid(row=0, column=0, sticky="w")
-        tk.Label(bottom_header, textvariable=self.meta_var, bg=COLORS["panel"], fg=COLORS["text_muted"], font=("Segoe UI", 9)).grid(row=0, column=1, sticky="e")
+        self.bottom_header = tk.Frame(self.bottom_band, bg=COLORS["panel"])
+        self.bottom_header.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 10))
+        self.bottom_header.grid_columnconfigure(0, weight=1)
+        self.bottom_title_label = tk.Label(self.bottom_header, text="Signal Overview", bg=COLORS["panel"], fg=COLORS["text"], font=("Segoe UI Semibold", 13))
+        self.bottom_title_label.grid(row=0, column=0, sticky="w")
+        self.bottom_meta_label = tk.Label(self.bottom_header, textvariable=self.meta_var, bg=COLORS["panel"], fg=COLORS["text_muted"], font=("Segoe UI", 9), justify="left")
+        self.bottom_meta_label.grid(row=0, column=1, sticky="e")
+
+        self.summary_tiles_frame = tk.Frame(self.bottom_band, bg=COLORS["panel"])
+        self.summary_tiles_frame.grid(row=1, column=0, sticky="ew", padx=14)
+        for column in range(3):
+            self.summary_tiles_frame.grid_columnconfigure(column, weight=1, uniform="summary_tile")
+
+        self.summary_blocks["last_4"] = self._create_stat_block(self.summary_tiles_frame, "Last 4 Min")
+        self.summary_blocks["last_8"] = self._create_stat_block(self.summary_tiles_frame, "Last 8 Min")
+        self.summary_blocks["session"] = self._create_stat_block(self.summary_tiles_frame, "Session Avg")
+        self.summary_blocks["last_4"]["frame"].grid(row=0, column=0, sticky="ew", padx=6)
+        self.summary_blocks["last_8"]["frame"].grid(row=0, column=1, sticky="ew", padx=6)
+        self.summary_blocks["session"]["frame"].grid(row=0, column=2, sticky="ew", padx=6)
+
+        self.engagement_summary_note_label = tk.Label(
+            self.bottom_band,
+            textvariable=self.engagement_summary_note_var,
+            bg=COLORS["panel"],
+            fg=COLORS["text_soft"],
+            anchor="w",
+            justify="left",
+            font=("Segoe UI", 9),
+        )
+        self.engagement_summary_note_label.grid(row=2, column=0, sticky="ew", padx=20, pady=(10, 0))
 
         self.feedback_info_label = tk.Label(
             self.bottom_band,
@@ -872,7 +1665,7 @@ class EngagementApp:
             justify="left",
             font=("Segoe UI", 9),
         )
-        self.feedback_info_label.grid(row=1, column=0, sticky="ew", padx=20)
+        self.feedback_info_label.grid(row=3, column=0, sticky="ew", padx=20, pady=(10, 0))
 
         self.feedback_status_label = tk.Label(
             self.bottom_band,
@@ -883,10 +1676,10 @@ class EngagementApp:
             justify="left",
             font=("Segoe UI", 9),
         )
-        self.feedback_status_label.grid(row=2, column=0, sticky="ew", padx=20, pady=(4, 10))
+        self.feedback_status_label.grid(row=4, column=0, sticky="ew", padx=20, pady=(4, 10))
 
         self.tiles_frame = tk.Frame(self.bottom_band, bg=COLORS["panel"])
-        self.tiles_frame.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 14))
+        self.tiles_frame.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 14))
         self._build_signal_tiles()
 
     def _build_signal_tiles(self) -> None:
@@ -1220,194 +2013,10 @@ class EngagementApp:
         else:
             self._update_preview(self.last_frame)
 
-    def _build_feedback_snapshot(self) -> dict[str, Any] | None:
-        if len(self.frame_buffer) < self.seq_len or len(self.output_history) == 0:
-            return None
-        output = self.display_output.copy().astype(np.float32)
-        engaged, not_engaged, _ = self._engagement_scores(output)
-        primary_confidence = max(engaged, not_engaged)
-        spotlight_key = self.spotlight_transition.get("current")
-        if not isinstance(spotlight_key, str) or not spotlight_key.startswith("head:"):
-            spotlight_key = None
-        active_signal = self._signal_for_key(output, spotlight_key) if spotlight_key else None
-        spotlight_confidence = float(active_signal["elevated"]) if active_signal is not None else 0.0
-        primary_threshold, spotlight_threshold = self._effective_thresholds()
-        return self.feedback_manager.build_review_snapshot(
-            frames=list(self.frame_buffer),
-            output=output,
-            model_variant=self.model_variant,
-            head_names=self.head_names,
-            class_count=self.class_count,
-            seq_len=self.seq_len,
-            img_size=self.img_size,
-            state=self.state,
-            headline=self.prediction_var.get(),
-            confidence_text=self.confidence_var.get(),
-            summary=self.summary_var.get(),
-            primary_confidence=primary_confidence,
-            spotlight_key=spotlight_key,
-            spotlight_confidence=spotlight_confidence,
-            primary_threshold=primary_threshold,
-            spotlight_threshold=spotlight_threshold,
-        )
-
-    def _close_review_dialog(self) -> None:
-        if self.review_dialog is None:
-            return
-        try:
-            self.review_dialog.grab_release()
-        except tk.TclError:
-            pass
-        try:
-            self.review_dialog.destroy()
-        except tk.TclError:
-            pass
-        self.review_dialog = None
-        self._set_review_button_state()
-
-    def open_review_dialog(self) -> None:
-        if self.review_dialog is not None:
-            self.review_dialog.lift()
-            self.review_dialog.focus_force()
-            return
-
-        snapshot = self._build_feedback_snapshot()
-        if snapshot is None:
-            self.feedback_status_var.set("Latest: No live prediction is ready to review yet.")
-            self._set_review_button_state()
-            return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Rate Prediction")
-        dialog.configure(bg=COLORS["panel"])
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
-        dialog.grab_set()
-        self.review_dialog = dialog
-        self._set_review_button_state()
-
-        container = tk.Frame(dialog, bg=COLORS["panel"])
-        container.pack(fill="both", expand=True, padx=18, pady=18)
-
-        tk.Label(container, text="Rate Prediction", bg=COLORS["panel"], fg=COLORS["text"], font=("Segoe UI Semibold", 15)).pack(anchor="w")
-        tk.Label(
-            container,
-            text=f"{snapshot['headline']} | {snapshot['confidence_text']}",
-            bg=COLORS["panel"],
-            fg=COLORS["text_soft"],
-            justify="left",
-            font=("Segoe UI", 10),
-        ).pack(anchor="w", pady=(6, 0))
-        tk.Label(
-            container,
-            text="Choose how correct the prediction felt, then keep, correct, or mark each visible head as Don't know.",
-            bg=COLORS["panel"],
-            fg=COLORS["text_muted"],
-            justify="left",
-            wraplength=520,
-            font=("Segoe UI", 9),
-        ).pack(anchor="w", pady=(6, 14))
-
-        rating_var = tk.IntVar(value=3)
-        rating_frame = tk.Frame(container, bg=COLORS["panel"])
-        rating_frame.pack(anchor="w", pady=(0, 12))
-        tk.Label(rating_frame, text="Correctness", bg=COLORS["panel"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 9)).pack(side="left", padx=(0, 12))
-        for score in range(1, 6):
-            tk.Radiobutton(
-                rating_frame,
-                text=str(score),
-                variable=rating_var,
-                value=score,
-                bg=COLORS["panel"],
-                fg=COLORS["text"],
-                selectcolor=COLORS["panel_alt"],
-                activebackground=COLORS["panel"],
-                activeforeground=COLORS["text"],
-                font=("Segoe UI", 9),
-            ).pack(side="left", padx=(0, 6))
-
-        selections: dict[int, tk.StringVar] = {}
-        heads_frame = tk.Frame(container, bg=COLORS["panel"])
-        heads_frame.pack(fill="x", expand=True)
-        predicted_labels = [int(np.argmax(head)) for head in np.asarray(snapshot["output"], dtype=np.float32)]
-        for spec in self.head_specs:
-            predicted_level = AFFECT_LEVELS[min(predicted_labels[spec["index"]], len(AFFECT_LEVELS) - 1)]
-            default_choice = f"Keep prediction ({predicted_level})"
-            choices = [default_choice, "Don't know", *AFFECT_LEVELS]
-            row = tk.Frame(heads_frame, bg=COLORS["panel"])
-            row.pack(fill="x", pady=4)
-            tk.Label(row, text=spec["label"], width=18, anchor="w", bg=COLORS["panel"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 9)).pack(side="left")
-            choice_var = tk.StringVar(value=default_choice)
-            tk.OptionMenu(row, choice_var, *choices).pack(side="left", fill="x", expand=True)
-            selections[spec["index"]] = choice_var
-
-        action_row = tk.Frame(container, bg=COLORS["panel"])
-        action_row.pack(fill="x", pady=(18, 0))
-
-        def submit_feedback() -> None:
-            corrected_labels: list[int | None] = []
-            known_mask: list[bool] = []
-            for spec in self.head_specs:
-                predicted_label = predicted_labels[spec["index"]]
-                choice = selections[spec["index"]].get()
-                if choice == "Don't know":
-                    corrected_labels.append(None)
-                    known_mask.append(False)
-                elif choice.startswith("Keep prediction"):
-                    corrected_labels.append(predicted_label)
-                    known_mask.append(True)
-                else:
-                    corrected_labels.append(AFFECT_LEVELS.index(choice))
-                    known_mask.append(True)
-
-            self.feedback_manager.submit_feedback(
-                snapshot,
-                rating=rating_var.get(),
-                corrected_labels=corrected_labels,
-                known_mask=known_mask,
-            )
-            self._refresh_feedback_insight()
-            if self.running and len(self.output_history) > 0:
-                self._update_primary_view(self.display_output)
-            self._close_review_dialog()
-
-        tk.Button(
-            action_row,
-            text="Submit",
-            command=submit_feedback,
-            bg=COLORS["green"],
-            fg=COLORS["text"],
-            activebackground=mix_color(COLORS["green"], "#ffffff", 0.12),
-            activeforeground=COLORS["text"],
-            relief="flat",
-            bd=0,
-            padx=18,
-            pady=9,
-            font=("Segoe UI Semibold", 10),
-            cursor="hand2",
-        ).pack(side="left")
-        tk.Button(
-            action_row,
-            text="Cancel",
-            command=self._close_review_dialog,
-            bg=COLORS["panel_alt"],
-            fg=COLORS["text"],
-            activebackground=mix_color(COLORS["panel_alt"], "#ffffff", 0.08),
-            activeforeground=COLORS["text"],
-            relief="flat",
-            bd=0,
-            padx=18,
-            pady=9,
-            font=("Segoe UI Semibold", 10),
-            cursor="hand2",
-        ).pack(side="left", padx=(10, 0))
-
-        dialog.protocol("WM_DELETE_WINDOW", self._close_review_dialog)
-
     def start(self) -> None:
         if self.running:
             return
-        self._close_review_dialog()
+        self._close_checkin_dialog()
         self.capture = open_camera(self.camera_index)
         if not self.capture or not self.capture.isOpened():
             self._set_error_view(f"Unable to open webcam on camera index {self.camera_index}.")
@@ -1424,14 +2033,15 @@ class EngagementApp:
         self.last_prediction_time = 0.0
         self.last_output_time = 0.0
         self._reset_temporal_smoothing()
+        self._reset_engagement_summary()
+        if not self.pomodoro_active and self.pomodoro_phase not in {"idle", "unavailable"}:
+            self._reset_pomodoro_state()
         with self.output_lock:
             self.pending_output = None
             self.pending_error = None
             self.inference_busy = False
             self.active_inference_id = None
 
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
         self._set_state(
             "warming_up",
             "Warming Up",
@@ -1440,14 +2050,17 @@ class EngagementApp:
             f"Frame buffer 0/{self.seq_len}",
             preview_badge="Warming",
         )
+        self.engagement_summary_note_var.set("Collecting live predictions for the 4-minute and 8-minute engagement summary.")
         self._update_spotlight(None)
         self._update_signal_tiles(self.display_output, None)
-        self._set_review_button_state()
+        self._sync_control_states()
         self._schedule_capture()
         self._schedule_ui()
 
     def stop(self) -> None:
-        self._close_review_dialog()
+        if self.pomodoro_active or self.checkin_dialog is not None or self.pomodoro_prompt_pending:
+            self._close_checkin_dialog()
+            self._reset_pomodoro_state(phase="stopped", reason="Pomodoro halted because live monitoring stopped.")
         self.running = False
         self.session_token += 1
         if self.capture_after_id:
@@ -1468,24 +2081,31 @@ class EngagementApp:
             self.pending_error = None
             self.inference_busy = False
             self.active_inference_id = None
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled", bg=COLORS["panel_alt"], fg=COLORS["text"])
         self.display_output = self._neutral_output()
         self.target_output = self._neutral_output()
         self._reset_temporal_smoothing()
         self._set_state("idle", "Camera Idle", "Waiting for live input", self._idle_summary(), self._idle_footer(), preview_badge="Idle")
         self._update_spotlight(None)
         self._update_signal_tiles(self.display_output, None)
+        if self.session_engagement_count > 0:
+            self.engagement_summary_note_var.set("Camera stopped. Summary blocks show the most recent live session.")
+        else:
+            self.engagement_summary_note_var.set(self._idle_engagement_summary_note())
         self.last_frame = None
         self._draw_preview_placeholder()
-        self._set_review_button_state()
+        self._sync_control_states()
 
     def _set_error_view(self, message: str) -> None:
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled", bg=COLORS["panel_alt"], fg=COLORS["text"])
+        if self.pomodoro_phase == "stopped":
+            self.pomodoro_status_reason = "Pomodoro halted because live monitoring hit a runtime error."
+            self._refresh_pomodoro_ui()
         self._set_state("error", "Runtime Error", message, "Check camera access or the ONNX runtime configuration.", message, preview_badge="Error")
         self.preview_label.configure(image="", text="Runtime error\nSee the status panel for details.", fg=COLORS["red"])
-        self._set_review_button_state()
+        if self.session_engagement_count > 0:
+            self.engagement_summary_note_var.set("Runtime error paused live updates. Summary blocks show the latest completed session data.")
+        else:
+            self.engagement_summary_note_var.set("Runtime error prevented the engagement summary from collecting live data.")
+        self._sync_control_states()
 
     def _schedule_capture(self, delay_ms: int = 15) -> None:
         if not self.closing:
@@ -1548,6 +2168,7 @@ class EngagementApp:
                 self.last_prediction_time = 0.0
                 self.last_output_time = 0.0
                 self._reset_temporal_smoothing()
+                self._reset_engagement_summary()
                 with self.output_lock:
                     self.pending_output = None
                     self.pending_error = None
@@ -1563,6 +2184,10 @@ class EngagementApp:
                     f"Frame buffer 0/{self.seq_len}",
                     preview_badge="Warming",
                 )
+                if self.pomodoro_active or self.checkin_dialog is not None or self.pomodoro_prompt_pending:
+                    self._close_checkin_dialog()
+                    self._reset_pomodoro_state(phase="stopped", reason="Pomodoro stopped after the camera recovered. Start a fresh 24-minute block.")
+                self.engagement_summary_note_var.set("Camera recovered. Collecting a fresh engagement summary window.")
                 self._schedule_capture(CAMERA_RECOVERY_DELAY_MS)
                 return
 
@@ -1574,6 +2199,7 @@ class EngagementApp:
         self.last_frame = frame
         self.frame_counter += 1
         self.frame_buffer.append(frame.copy())
+        self._record_pomodoro_frame_sample(frame, time.time())
         self._update_preview(frame)
 
         buffered = len(self.frame_buffer)
@@ -1628,17 +2254,19 @@ class EngagementApp:
                 stacked = np.stack(list(self.output_history), axis=0)
                 self.target_output = stacked.mean(axis=0).astype(np.float32)
                 self.last_output_time = time.time()
-                self._set_review_button_state()
+                self._record_engagement_sample(self.target_output, self.last_output_time)
+                self._record_pomodoro_output_sample(self.target_output, self.last_output_time)
 
         if self.target_output is not None and len(self.frame_buffer) >= self.seq_len:
             self.display_output = ((1.0 - DISPLAY_BLEND) * self.display_output + DISPLAY_BLEND * self.target_output).astype(np.float32)
             self._update_primary_view(self.display_output)
 
+        self._update_pomodoro_timer()
         self._schedule_ui()
 
     def on_close(self) -> None:
         self.closing = True
-        self._close_review_dialog()
+        self._close_checkin_dialog()
         self.stop()
         self.root.destroy()
 

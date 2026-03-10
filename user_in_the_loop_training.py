@@ -87,6 +87,10 @@ class FeedbackRecord:
     trusted_for_training: bool
     trust_level: str
     clip_path: str
+    feedback_source: str = "manual_review"
+    window_start_epoch: float | None = None
+    window_end_epoch: float | None = None
+    derived_rating: int | None = None
 
 
 @dataclass
@@ -100,7 +104,7 @@ class ThresholdState:
     spotlight_agreement_ema: float = 0.5
     effective_primary_threshold: float = DEFAULT_PRIMARY_THRESHOLD
     effective_spotlight_threshold: float = DEFAULT_SPOTLIGHT_THRESHOLD
-    last_feedback_status: str = "No feedback collected yet."
+    last_feedback_status: str = "No check-ins collected yet."
     last_feedback_id: str | None = None
     last_online_trained_at: float = 0.0
     last_offline_trained_at: float = 0.0
@@ -246,6 +250,10 @@ class FeedbackManager:
         spotlight_confidence: float,
         primary_threshold: float,
         spotlight_threshold: float,
+        feedback_source: str = "manual_review",
+        window_start_epoch: float | None = None,
+        window_end_epoch: float | None = None,
+        derived_rating: int | None = None,
     ) -> dict[str, Any]:
         return {
             "frames": [frame.copy() for frame in frames],
@@ -264,6 +272,10 @@ class FeedbackManager:
             "spotlight_confidence": float(spotlight_confidence),
             "primary_threshold": float(primary_threshold),
             "spotlight_threshold": float(spotlight_threshold),
+            "feedback_source": str(feedback_source),
+            "window_start_epoch": None if window_start_epoch is None else float(window_start_epoch),
+            "window_end_epoch": None if window_end_epoch is None else float(window_end_epoch),
+            "derived_rating": None if derived_rating is None else int(derived_rating),
         }
 
     def submit_feedback(
@@ -294,6 +306,10 @@ class FeedbackManager:
             known_mask=known_mask,
             explicit_corrections=explicit_corrections,
         )
+        feedback_source = str(snapshot.get("feedback_source") or "manual_review")
+        derived_rating = snapshot.get("derived_rating")
+        if derived_rating is None:
+            derived_rating = rating
         created_at, created_at_epoch = _utcnow()
         feedback_id = f"{int(created_at_epoch * 1000)}_{uuid.uuid4().hex[:8]}"
         clip_path = self._save_clip(feedback_id, snapshot["frames"])
@@ -327,6 +343,10 @@ class FeedbackManager:
             trusted_for_training=trusted,
             trust_level=trust_level,
             clip_path=str(clip_path),
+            feedback_source=feedback_source,
+            window_start_epoch=None if snapshot.get("window_start_epoch") is None else float(snapshot["window_start_epoch"]),
+            window_end_epoch=None if snapshot.get("window_end_epoch") is None else float(snapshot["window_end_epoch"]),
+            derived_rating=int(derived_rating),
         )
 
         _append_jsonl(self.log_path, asdict(record))
@@ -423,9 +443,10 @@ class FeedbackManager:
         return rating_score, (1.0 if record.trusted_for_training else 0.35)
 
     def _feedback_status_message(self, record: FeedbackRecord, *, old_primary: float, old_spotlight: float) -> str:
-        prefix = "Trusted feedback saved." if record.trusted_for_training else "Feedback saved for analytics."
+        noun = "check-in" if record.feedback_source == "pomodoro_checkin" else "feedback"
+        prefix = f"Trusted {noun} saved." if record.trusted_for_training else f"{noun.title()} saved for analytics."
         if self.state.review_count < ADAPT_AFTER_REVIEWS:
-            return f"{prefix} Thresholds stay at base values until {ADAPT_AFTER_REVIEWS} reviews."
+            return f"{prefix} Thresholds stay at base values until {ADAPT_AFTER_REVIEWS} check-ins."
         primary_shift = self.state.effective_primary_threshold - old_primary
         spotlight_shift = self.state.effective_spotlight_threshold - old_spotlight
         changes = []
@@ -503,7 +524,11 @@ class FeedbackManager:
                     "labels": labels,
                     "known_mask": known_mask,
                     "rating": int(record["rating"]),
+                    "derived_rating": int(record.get("derived_rating", record["rating"])),
                     "trust_level": str(record["trust_level"]),
+                    "feedback_source": str(record.get("feedback_source", "manual_review")),
+                    "window_start_epoch": record.get("window_start_epoch"),
+                    "window_end_epoch": record.get("window_end_epoch"),
                     "head_names": list(record["head_names"])[:num_heads],
                     "class_count": int(record["class_count"]),
                     "seq_len": int(record["seq_len"]),
