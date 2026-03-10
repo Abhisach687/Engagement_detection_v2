@@ -91,7 +91,7 @@ Fastest run path:
    .\.venv\Scripts\python.exe app.py
    ```
 4. Click `Start Camera`.
-5. Once predictions appear, click `Rate Prediction` to review them and feed trusted labels back into the system.
+5. Click `Start Pomodoro` to begin the 24-minute focus session and answer the timed self-checks every 8 minutes.
 
 If you want the feedback fine-tuning commands to work on CPU when CUDA is unavailable, set:
 
@@ -108,9 +108,9 @@ App behavior:
 - Otherwise it falls back to the original engagement-only distilled student.
 - If the required ONNX export is missing, the app tries to export it automatically from the saved PyTorch or TorchScript checkpoint.
 - The GUI shows the active device (`cuda` or `cpu`) and the active model variant.
-- The desktop UI is now a fixed single-screen dashboard sized for laptop monitoring, with a large live preview, a primary engagement decision panel, and a compact bottom signal band.
+- The desktop UI opens in a split-screen-friendly layout, supports mouse-wheel and trackpad scrolling, and includes a live preview, engagement decision panel, rolling summaries, and a Pomodoro timer card.
 - When the multi-affect ONNX sidecar metadata is present, the app derives the secondary affect tiles from `head_names` and uses the feedback-adjusted spotlight threshold shown in the UI.
-- After enough reviews are collected, the app adjusts its live primary and spotlight thresholds from user feedback without changing model weights in-session.
+- After enough check-ins are collected, the app adjusts its live primary and spotlight thresholds from user feedback without changing model weights in-session.
 
 ### User-in-the-Loop Feedback
 Run the live app first:
@@ -122,29 +122,30 @@ Run the live app first:
 Then use the feedback loop like this:
 
 1. Click `Start Camera`.
-2. Wait until the app finishes buffering frames and starts showing live predictions.
-3. Click `Rate Prediction`.
-4. Give the prediction a score from `1` to `5`.
-5. For each visible head, either keep the predicted label, correct it, or choose `Don't know`.
-6. Submit the review.
+2. Click `Start Pomodoro`.
+3. Work through the current 8-minute focus block while the app tracks live model outputs.
+4. When the self-check opens, answer how engaged, bored, confused, and frustrated you felt in the last 8 minutes.
+5. Submit the check-in, skip it, or stop the Pomodoro.
+6. Repeat for all three 8-minute blocks in the 24-minute session.
 
 What happens after submission:
-- The reviewed frame window is saved under `cache/user_feedback/clips/`.
-- The review metadata is appended to `cache/user_feedback/feedback_log.jsonl`.
+- The corresponding Pomodoro frame window is saved under `cache/user_feedback/clips/`.
+- The check-in metadata is appended to `cache/user_feedback/feedback_log.jsonl`.
 - The app updates the feedback insight line in the UI.
-- After `5` reviews, the live primary and spotlight thresholds begin adapting conservatively from the collected feedback.
+- After `5` check-ins, the live primary and spotlight thresholds begin adapting conservatively from the collected feedback.
 
 Trust rules:
 - Explicit corrections are trusted for training.
-- Ratings `4` or `5` are trusted for training only when all visible heads are known.
+- The app derives an internal rating from how closely the user self-check matches the model's 8-minute aggregate.
+- Derived ratings `4` or `5` are trusted for training only when all visible heads are known.
 - `Don't know` excludes that head from supervised training.
-- Ratings without strong trust stay available for analytics and live threshold steering, but are not exported as supervised training samples by default.
+- Check-ins without strong trust stay available for analytics and live threshold steering, but are not exported as supervised training samples by default.
 
 ### Feedback Commands
-Use these commands after you have collected some reviews:
+Use these commands after you have collected some check-ins:
 
 ```powershell
-# inspect review counts, trust counts, rating distribution, and current thresholds
+# inspect check-in counts, trust counts, rating distribution, and current thresholds
 .\.venv\Scripts\python.exe user_in_the_loop_training.py summarize
 
 # export the currently trusted feedback records into a training manifest
@@ -164,6 +165,18 @@ Command behavior:
 - `train_offline` creates a fuller candidate fine-tune from the complete trusted user-labeled pool.
 - Candidate checkpoints are written under `cache/user_feedback/candidates/` and are not auto-promoted into the live app.
 
+### Project Explainer
+The explainer workflow now lives entirely under `cache/explainer/`.
+
+- Markdown explainer: `cache/explainer/project_explained.md`
+- PDF explainer: `cache/explainer/project_explained.pdf`
+
+Regenerate the explainer from the repo root with:
+
+```powershell
+.\.venv\Scripts\python.exe cache\explainer\generate_explainer.py
+```
+
 ## Outputs
 - Models and metrics: `models/`
 - Training curves and logs: `logs/`
@@ -177,6 +190,8 @@ Command behavior:
 - User feedback log: `cache/user_feedback/feedback_log.jsonl`
 - User feedback exports: `cache/user_feedback/exports/`
 - User feedback candidate checkpoints: `cache/user_feedback/candidates/`
+- Project explainer markdown: `cache/explainer/project_explained.md`
+- Project explainer PDF: `cache/explainer/project_explained.pdf`
 
 ## Current Training Defaults
 - XGB uses version-safe GPU settings when available and falls back to CPU `hist` if unsupported.

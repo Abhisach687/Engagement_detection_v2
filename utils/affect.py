@@ -14,12 +14,101 @@ AFFECT_DISPLAY_NAMES = {
     "Confusion": "Confused",
     "Frustration": "Frustrated",
 }
-AFFECT_LEVELS = ("Very Low", "Low", "High", "Very High")
+RAW_AFFECT_LEVELS = ("Very Low", "Low", "High", "Very High")
+DISPLAY_AFFECT_LEVELS = ("Very Low", "Low", "Medium", "High", "Very High")
+AFFECT_LEVELS = RAW_AFFECT_LEVELS
+DISPLAY_LEVEL_ANCHORS = (0.0, 1.0, 3.0, 4.0)
+MEDIUM_DISPLAY_RANGE = (1.6, 2.4)
+MEDIUM_CENTER_MIN_MASS = 0.55
+MEDIUM_BALANCE_MAX_GAP = 0.20
+MEDIUM_EXTREME_MAX_MASS = 0.20
+DISPLAY_LEVEL_INDEX = {label: index for index, label in enumerate(DISPLAY_AFFECT_LEVELS)}
 NUM_AFFECTS = len(AFFECT_COLUMNS)
 
 
 def row_to_affect_labels(row) -> list[int]:
     return [int(row[column]) for column in AFFECT_COLUMNS]
+
+
+def _normalized_probabilities(probabilities: list[float] | tuple[float, ...]) -> list[float]:
+    values = [max(0.0, float(value)) for value in probabilities]
+    if len(values) != len(RAW_AFFECT_LEVELS):
+        raise ValueError(f"Expected {len(RAW_AFFECT_LEVELS)} raw affect probabilities, got {len(values)}.")
+    total = float(sum(values))
+    if not math.isfinite(total) or total <= 0.0:
+        return [1.0 / len(values)] * len(values)
+    return [value / total for value in values]
+
+
+def display_score_from_raw_probabilities(probabilities: list[float] | tuple[float, ...]) -> float:
+    normalized = _normalized_probabilities(probabilities)
+    return float(sum(probability * anchor for probability, anchor in zip(normalized, DISPLAY_LEVEL_ANCHORS)))
+
+
+def display_marker_position(score: float) -> float:
+    return max(0.0, min(1.0, float(score) / 4.0))
+
+
+def display_level_from_raw_index(raw_index: int) -> str:
+    index = int(raw_index)
+    if index < 0 or index >= len(RAW_AFFECT_LEVELS):
+        raise ValueError(f"Raw affect index out of range: {raw_index}")
+    return DISPLAY_AFFECT_LEVELS[index if index < 2 else index + 1]
+
+
+def display_level_index(label: str | None) -> int | None:
+    if label is None:
+        return None
+    return DISPLAY_LEVEL_INDEX[str(label)]
+
+
+def display_label_to_raw_label(label: str | None) -> int | None:
+    if label is None:
+        return None
+    normalized = str(label).strip()
+    if normalized == "Medium":
+        return None
+    if normalized == "Very Low":
+        return 0
+    if normalized == "Low":
+        return 1
+    if normalized == "High":
+        return 2
+    if normalized == "Very High":
+        return 3
+    raise ValueError(f"Unsupported display affect label: {label}")
+
+
+def infer_display_level(probabilities: list[float] | tuple[float, ...]) -> dict[str, float | int | str]:
+    normalized = _normalized_probabilities(probabilities)
+    score = display_score_from_raw_probabilities(normalized)
+    very_low, low, high, very_high = normalized
+    center_mass = low + high
+    centered_gap = abs(low - high)
+    extreme_mass = max(very_low, very_high)
+
+    if (
+        MEDIUM_DISPLAY_RANGE[0] <= score <= MEDIUM_DISPLAY_RANGE[1]
+        and center_mass >= MEDIUM_CENTER_MIN_MASS
+        and centered_gap <= MEDIUM_BALANCE_MAX_GAP
+        and extreme_mass <= MEDIUM_EXTREME_MAX_MASS
+    ):
+        label = "Medium"
+    elif score < 0.5:
+        label = "Very Low"
+    elif score < 2.0:
+        label = "Low"
+    elif score < 3.5:
+        label = "High"
+    else:
+        label = "Very High"
+    index = DISPLAY_LEVEL_INDEX[label]
+    return {
+        "label": label,
+        "index": index,
+        "score": score,
+        "marker_position": display_marker_position(score),
+    }
 
 
 def multitask_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

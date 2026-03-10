@@ -18,6 +18,16 @@ import torch.nn.functional as F
 from torch import amp
 from torch.utils.data import DataLoader, Dataset
 
+from utils.affect import (
+    AFFECT_COLUMNS,
+    AFFECT_LEVELS,
+    DISPLAY_AFFECT_LEVELS,
+    display_label_to_raw_label,
+    display_level_from_raw_index,
+    display_level_index,
+    infer_display_level,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / "cache"
@@ -40,8 +50,8 @@ ADAPT_AFTER_REVIEWS = 5
 EMA_ALPHA = 0.20
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-AFFECT_COLUMNS = ("Engagement", "Boredom", "Confusion", "Frustration")
-AFFECT_LEVELS = ("Very Low", "Low", "High", "Very High")
+DISPLAY_CLASS_COUNT = len(DISPLAY_AFFECT_LEVELS)
+MEDIUM_FEEDBACK_WEIGHT = 0.5
 
 MODEL_VARIANTS = {
     "engagement": {
@@ -81,9 +91,16 @@ class FeedbackRecord:
     rating: int
     predicted_labels: list[int]
     predicted_probabilities: list[list[float]]
+    predicted_display_levels: list[str]
+    predicted_display_scores: list[float]
     corrected_labels: list[int | None]
+    corrected_display_levels: list[str | None]
     known_mask: list[bool]
     explicit_corrections: list[bool]
+    display_known_mask: list[bool]
+    trainable_known_mask: list[bool]
+    display_corrections: list[bool]
+    trainable_corrections: list[bool]
     trusted_for_training: bool
     trust_level: str
     clip_path: str
@@ -119,6 +136,76 @@ def _utcnow() -> tuple[str, float]:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
+
+
+def _display_predictions(predicted_probabilities: list[list[float]]) -> tuple[list[str], list[float]]:
+    display_levels: list[str] = []
+    display_scores: list[float] = []
+    for head_probabilities in predicted_probabilities:
+        inferred = infer_display_level(head_probabilities)
+        display_levels.append(str(inferred["label"]))
+        display_scores.append(float(inferred["score"]))
+    return display_levels, display_scores
+
+
+def _display_levels_from_raw_labels(corrected_labels: list[int | None], known_mask: list[bool]) -> list[str | None]:
+    display_levels: list[str | None] = []
+    for index, known in enumerate(known_mask):
+        if not known:
+            display_levels.append(None)
+            continue
+        corrected = corrected_labels[index] if index < len(corrected_labels) else None
+        if corrected is None:
+            display_levels.append(None)
+            continue
+        display_levels.append(display_level_from_raw_index(int(corrected)))
+    return display_levels
+
+
+def _display_correction_flags(
+    predicted_display_levels: list[str],
+    corrected_display_levels: list[str | None],
+    display_known_mask: list[bool],
+) -> list[bool]:
+    flags: list[bool] = []
+    for index, predicted in enumerate(predicted_display_levels):
+        known = bool(display_known_mask[index]) if index < len(display_known_mask) else False
+        corrected = corrected_display_levels[index] if index < len(corrected_display_levels) else None
+        flags.append(bool(known and corrected is not None and str(corrected) != str(predicted)))
+    return flags
+
+
+def _trainable_correction_flags(
+    predicted_labels: list[int],
+    corrected_labels: list[int | None],
+    trainable_known_mask: list[bool],
+) -> list[bool]:
+    flags: list[bool] = []
+    for index, predicted in enumerate(predicted_labels):
+        known = bool(trainable_known_mask[index]) if index < len(trainable_known_mask) else False
+        corrected = corrected_labels[index] if index < len(corrected_labels) else None
+        flags.append(bool(known and corrected is not None and int(corrected) != int(predicted)))
+    return flags
+
+
+def _coerce_bool_list(values: list[Any] | tuple[Any, ...], length: int, default: bool = False) -> list[bool]:
+    return [bool(values[index]) if index < len(values) else bool(default) for index in range(length)]
+
+
+def _coerce_optional_int_list(values: list[Any] | tuple[Any, ...], length: int) -> list[int | None]:
+    coerced: list[int | None] = []
+    for index in range(length):
+        value = values[index] if index < len(values) else None
+        coerced.append(None if value is None else int(value))
+    return coerced
+
+
+def _coerce_optional_str_list(values: list[Any] | tuple[Any, ...], length: int) -> list[str | None]:
+    coerced: list[str | None] = []
+    for index in range(length):
+        value = values[index] if index < len(values) else None
+        coerced.append(None if value is None else str(value))
+    return coerced
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -218,7 +305,129 @@ class FeedbackManager:
             "spotlight": float(self.state.effective_spotlight_threshold),
         }
 
+    def _normalize_feedback_row(self, record: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(record)
+        predicted_probabilities_raw = list(normalized.get("predicted_probabilities", []))
+        head_count = int(
+            normalized.get("head_count")
+            or len(predicted_probabilities_raw)
+            or len(normalized.get("predicted_labels", []))
+            or len(normalized.get("head_names", []))
+            or 0
+        )
+        predicted_probabilities: list[list[float]] = []
+        for index in range(head_count):
+            if index < len(predicted_probabilities_raw) and len(predicted_probabilities_raw[index]) == DEFAULT_NUM_CLASSES:
+                predicted_probabilities.append([float(value) for value in predicted_probabilities_raw[index]])
+            else:
+                predicted_probabilities.append([1.0 / DEFAULT_NUM_CLASSES] * DEFAULT_NUM_CLASSES)
+
+        predicted_labels_raw = list(normalized.get("predicted_labels", []))
+        predicted_labels = [
+            int(predicted_labels_raw[index]) if index < len(predicted_labels_raw) else int(np.argmax(predicted_probabilities[index]))
+            for index in range(head_count)
+        ]
+        predicted_display_levels, predicted_display_scores = _display_predictions(predicted_probabilities)
+
+        corrected_labels = _coerce_optional_int_list(list(normalized.get("corrected_labels", [])), head_count)
+        legacy_known_mask = _coerce_bool_list(list(normalized.get("known_mask", [])), head_count, default=False)
+        corrected_display_levels_raw = list(normalized.get("corrected_display_levels", []))
+        if corrected_display_levels_raw:
+            corrected_display_levels = _coerce_optional_str_list(corrected_display_levels_raw, head_count)
+        else:
+            corrected_display_levels = _display_levels_from_raw_labels(corrected_labels, legacy_known_mask)
+
+        display_known_mask_raw = list(normalized.get("display_known_mask", []))
+        if display_known_mask_raw:
+            display_known_mask = _coerce_bool_list(display_known_mask_raw, head_count, default=False)
+        else:
+            display_known_mask = [level is not None for level in corrected_display_levels] if corrected_display_levels else legacy_known_mask
+
+        trainable_known_mask_raw = list(normalized.get("trainable_known_mask", []))
+        if trainable_known_mask_raw:
+            trainable_known_mask = _coerce_bool_list(trainable_known_mask_raw, head_count, default=False)
+        else:
+            trainable_known_mask = [
+                bool(known and level is not None and level != "Medium")
+                for known, level in zip(display_known_mask, corrected_display_levels)
+            ]
+
+        display_corrections_raw = list(normalized.get("display_corrections", []))
+        if display_corrections_raw:
+            display_corrections = _coerce_bool_list(display_corrections_raw, head_count, default=False)
+        else:
+            display_corrections = _display_correction_flags(
+                predicted_display_levels,
+                corrected_display_levels,
+                display_known_mask,
+            )
+
+        trainable_corrections_raw = list(normalized.get("trainable_corrections", []))
+        if trainable_corrections_raw:
+            trainable_corrections = _coerce_bool_list(trainable_corrections_raw, head_count, default=False)
+        else:
+            trainable_corrections = _trainable_correction_flags(
+                predicted_labels,
+                corrected_labels,
+                trainable_known_mask,
+            )
+
+        normalized["head_count"] = head_count
+        normalized["class_count"] = int(normalized.get("class_count", DEFAULT_NUM_CLASSES) or DEFAULT_NUM_CLASSES)
+        normalized["predicted_probabilities"] = predicted_probabilities
+        normalized["predicted_labels"] = predicted_labels
+        normalized["predicted_display_levels"] = predicted_display_levels
+        normalized["predicted_display_scores"] = [float(value) for value in predicted_display_scores]
+        normalized["corrected_labels"] = corrected_labels
+        normalized["corrected_display_levels"] = corrected_display_levels
+        normalized["display_known_mask"] = display_known_mask
+        normalized["trainable_known_mask"] = trainable_known_mask
+        normalized["display_corrections"] = display_corrections
+        normalized["trainable_corrections"] = trainable_corrections
+        normalized["known_mask"] = display_known_mask
+        normalized["explicit_corrections"] = display_corrections
+        return normalized
+
+    def _aggregate_head_metrics(self, records: list[dict[str, Any]]) -> dict[str, float | int]:
+        total_predicted_heads = 0
+        inferred_medium_heads = 0
+        display_known_heads = 0
+        selected_medium_heads = 0
+        trainable_heads = 0
+        steering_only_heads = 0
+        for record in records:
+            predicted_display_levels = [str(value) for value in record.get("predicted_display_levels", [])]
+            display_known_mask = [bool(value) for value in record.get("display_known_mask", [])]
+            trainable_known_mask = [bool(value) for value in record.get("trainable_known_mask", [])]
+            corrected_display_levels = list(record.get("corrected_display_levels", []))
+            total_predicted_heads += len(predicted_display_levels)
+            inferred_medium_heads += sum(1 for value in predicted_display_levels if value == "Medium")
+            display_known_heads += sum(1 for value in display_known_mask if value)
+            selected_medium_heads += sum(
+                1
+                for known, corrected in zip(display_known_mask, corrected_display_levels)
+                if known and corrected == "Medium"
+            )
+            trainable_heads += sum(1 for value in trainable_known_mask if value)
+            steering_only_heads += sum(
+                1 for display_known, trainable in zip(display_known_mask, trainable_known_mask) if display_known and not trainable
+            )
+        return {
+            "total_predicted_heads": total_predicted_heads,
+            "display_known_heads": display_known_heads,
+            "inferred_medium_heads": inferred_medium_heads,
+            "selected_medium_heads": selected_medium_heads,
+            "trainable_heads": trainable_heads,
+            "steering_only_heads": steering_only_heads,
+            "inferred_medium_rate": (inferred_medium_heads / total_predicted_heads) if total_predicted_heads else 0.0,
+            "selected_medium_rate": (selected_medium_heads / display_known_heads) if display_known_heads else 0.0,
+            "trainable_head_rate": (trainable_heads / display_known_heads) if display_known_heads else 0.0,
+            "steering_only_head_rate": (steering_only_heads / display_known_heads) if display_known_heads else 0.0,
+        }
+
     def current_session_insight(self) -> dict[str, Any]:
+        session_records = [record for record in self.all_feedback() if str(record.get("session_id")) == self.state.session_id]
+        head_metrics = self._aggregate_head_metrics(session_records)
         return {
             "session_id": self.state.session_id,
             "review_count": self.state.review_count,
@@ -229,6 +438,7 @@ class FeedbackManager:
             "spotlight_threshold": self.state.effective_spotlight_threshold,
             "last_feedback_status": self.state.last_feedback_status,
             "last_feedback_id": self.state.last_feedback_id,
+            **head_metrics,
         }
 
     def build_review_snapshot(
@@ -283,8 +493,8 @@ class FeedbackManager:
         snapshot: dict[str, Any],
         *,
         rating: int,
-        corrected_labels: list[int | None],
-        known_mask: list[bool],
+        corrected_display_levels: list[str | None],
+        display_known_mask: list[bool],
     ) -> FeedbackRecord:
         rating = int(rating)
         if rating < 1 or rating > 5:
@@ -292,19 +502,32 @@ class FeedbackManager:
 
         output = np.asarray(snapshot["output"], dtype=np.float32)
         predicted_labels = [int(np.argmax(head)) for head in output]
+        predicted_display_levels, predicted_display_scores = _display_predictions(output.tolist())
         head_count = int(output.shape[0])
-        if len(corrected_labels) != head_count or len(known_mask) != head_count:
+        if len(corrected_display_levels) != head_count or len(display_known_mask) != head_count:
             raise ValueError("Feedback dimensions do not match the active heads.")
 
-        explicit_corrections = []
-        for index, predicted in enumerate(predicted_labels):
-            corrected = corrected_labels[index]
-            explicit_corrections.append(bool(known_mask[index] and corrected is not None and int(corrected) != predicted))
+        corrected_labels = [display_label_to_raw_label(label) for label in corrected_display_levels]
+        trainable_known_mask = [
+            bool(known and label is not None and str(label) != "Medium")
+            for known, label in zip(display_known_mask, corrected_display_levels)
+        ]
+        display_corrections = _display_correction_flags(
+            predicted_display_levels,
+            corrected_display_levels,
+            display_known_mask,
+        )
+        trainable_corrections = _trainable_correction_flags(
+            predicted_labels,
+            corrected_labels,
+            trainable_known_mask,
+        )
 
         trust_level, trusted = self._classify_feedback(
             rating=rating,
-            known_mask=known_mask,
-            explicit_corrections=explicit_corrections,
+            display_known_mask=display_known_mask,
+            trainable_known_mask=trainable_known_mask,
+            trainable_corrections=trainable_corrections,
         )
         feedback_source = str(snapshot.get("feedback_source") or "manual_review")
         derived_rating = snapshot.get("derived_rating")
@@ -337,9 +560,16 @@ class FeedbackManager:
             rating=rating,
             predicted_labels=predicted_labels,
             predicted_probabilities=output.tolist(),
+            predicted_display_levels=predicted_display_levels,
+            predicted_display_scores=predicted_display_scores,
             corrected_labels=[None if value is None else int(value) for value in corrected_labels],
-            known_mask=[bool(value) for value in known_mask],
-            explicit_corrections=explicit_corrections,
+            corrected_display_levels=[None if value is None else str(value) for value in corrected_display_levels],
+            known_mask=[bool(value) for value in display_known_mask],
+            explicit_corrections=display_corrections,
+            display_known_mask=[bool(value) for value in display_known_mask],
+            trainable_known_mask=trainable_known_mask,
+            display_corrections=display_corrections,
+            trainable_corrections=trainable_corrections,
             trusted_for_training=trusted,
             trust_level=trust_level,
             clip_path=str(clip_path),
@@ -365,15 +595,18 @@ class FeedbackManager:
         self,
         *,
         rating: int,
-        known_mask: list[bool],
-        explicit_corrections: list[bool],
+        display_known_mask: list[bool],
+        trainable_known_mask: list[bool],
+        trainable_corrections: list[bool],
     ) -> tuple[str, bool]:
-        any_known = any(known_mask)
-        all_known = all(known_mask) if known_mask else False
-        any_correction = any(explicit_corrections)
-        trusted = bool(any_correction or (rating >= 4 and any_known and all_known))
-        if not any_known:
+        any_display_known = any(display_known_mask)
+        any_trainable = any(trainable_known_mask)
+        any_trainable_correction = any(trainable_corrections)
+        trusted = bool(any_trainable and (any_trainable_correction or rating >= 4))
+        if not any_display_known:
             return "analytics_only_all_unknown", False
+        if any_display_known and not any_trainable:
+            return "analytics_only_medium_only", False
         if trusted:
             return "trusted_for_training", True
         return "analytics_only", False
@@ -419,13 +652,16 @@ class FeedbackManager:
         self.state.last_feedback_status = self._feedback_status_message(record, old_primary=old_primary, old_spotlight=old_spotlight)
 
     def _primary_signal(self, record: FeedbackRecord, rating_score: float) -> tuple[float, float]:
-        if not record.known_mask:
+        if not record.display_known_mask:
             return 0.5, 0.0
-        if not record.known_mask[0]:
-            return 0.5, 0.05
-        if record.explicit_corrections[0]:
-            return 0.0, 1.0
-        return rating_score, (1.0 if record.trusted_for_training else 0.35)
+        if not record.display_known_mask[0]:
+            return 0.5, 0.0
+        corrected_level = record.corrected_display_levels[0]
+        base_weight = MEDIUM_FEEDBACK_WEIGHT if corrected_level == "Medium" else 1.0
+        trust_weight = 1.0 if record.trusted_for_training else 0.35
+        if record.display_corrections[0]:
+            return 0.0, base_weight * trust_weight
+        return rating_score, base_weight * trust_weight
 
     def _spotlight_signal(self, record: FeedbackRecord, rating_score: float) -> tuple[float, float]:
         if not record.spotlight_key or not record.spotlight_key.startswith("head:"):
@@ -434,13 +670,16 @@ class FeedbackManager:
             index = int(record.spotlight_key.split(":", 1)[1])
         except ValueError:
             return 0.5, 0.0
-        if index < 0 or index >= len(record.known_mask):
+        if index < 0 or index >= len(record.display_known_mask):
             return 0.5, 0.0
-        if not record.known_mask[index]:
-            return 0.5, 0.05
-        if record.explicit_corrections[index]:
-            return 0.0, 1.0
-        return rating_score, (1.0 if record.trusted_for_training else 0.35)
+        if not record.display_known_mask[index]:
+            return 0.5, 0.0
+        corrected_level = record.corrected_display_levels[index]
+        base_weight = MEDIUM_FEEDBACK_WEIGHT if corrected_level == "Medium" else 1.0
+        trust_weight = 1.0 if record.trusted_for_training else 0.35
+        if record.display_corrections[index]:
+            return 0.0, base_weight * trust_weight
+        return rating_score, base_weight * trust_weight
 
     def _feedback_status_message(self, record: FeedbackRecord, *, old_primary: float, old_spotlight: float) -> str:
         noun = "check-in" if record.feedback_source == "pomodoro_checkin" else "feedback"
@@ -459,7 +698,7 @@ class FeedbackManager:
         return f"{prefix} Adjusted {' and '.join(changes)}."
 
     def all_feedback(self) -> list[dict[str, Any]]:
-        return _read_jsonl(self.log_path)
+        return [self._normalize_feedback_row(record) for record in _read_jsonl(self.log_path)]
 
     def summarize_feedback(self) -> dict[str, Any]:
         records = self.all_feedback()
@@ -472,12 +711,13 @@ class FeedbackManager:
             rating_distribution[str(int(record["rating"]))] += 1
             if record.get("trusted_for_training"):
                 trusted += 1
-            known_mask = [bool(value) for value in record.get("known_mask", [])]
+            known_mask = [bool(value) for value in record.get("display_known_mask", [])]
             total_unknown_heads += sum(1 for value in known_mask if not value)
             total_heads += len(known_mask)
             variant = str(record.get("model_variant", ""))
             if variant in variant_counts:
                 variant_counts[variant] += 1
+        head_metrics = self._aggregate_head_metrics(records)
         return {
             "total_reviews": len(records),
             "trusted_reviews": trusted,
@@ -485,6 +725,7 @@ class FeedbackManager:
             "unknown_head_rate": (total_unknown_heads / total_heads) if total_heads else 0.0,
             "rating_distribution": rating_distribution,
             "variant_counts": variant_counts,
+            **head_metrics,
             "current_thresholds": self.effective_thresholds(),
             "current_session": self.current_session_insight(),
         }
@@ -503,14 +744,15 @@ class FeedbackManager:
             created_at_epoch = float(record.get("created_at_epoch", 0.0) or 0.0)
             if since_epoch is not None and created_at_epoch <= since_epoch:
                 continue
-            known_mask = [bool(value) for value in record.get("known_mask", [])][:num_heads]
-            if not any(known_mask):
+            display_known_mask = [bool(value) for value in record.get("display_known_mask", [])][:num_heads]
+            trainable_known_mask = [bool(value) for value in record.get("trainable_known_mask", [])][:num_heads]
+            if not any(trainable_known_mask):
                 continue
             predicted = [int(value) for value in record.get("predicted_labels", [])][:num_heads]
             corrected = record.get("corrected_labels", [])[:num_heads]
             labels = []
             for index in range(num_heads):
-                if not known_mask[index]:
+                if not trainable_known_mask[index]:
                     labels.append(-1)
                 else:
                     corrected_value = corrected[index]
@@ -522,7 +764,9 @@ class FeedbackManager:
                     "created_at_epoch": created_at_epoch,
                     "clip_path": str(record["clip_path"]),
                     "labels": labels,
-                    "known_mask": known_mask,
+                    "known_mask": trainable_known_mask,
+                    "display_known_mask": display_known_mask,
+                    "trainable_known_mask": trainable_known_mask,
                     "rating": int(record["rating"]),
                     "derived_rating": int(record.get("derived_rating", record["rating"])),
                     "trust_level": str(record["trust_level"]),
@@ -531,6 +775,10 @@ class FeedbackManager:
                     "window_end_epoch": record.get("window_end_epoch"),
                     "head_names": list(record["head_names"])[:num_heads],
                     "class_count": int(record["class_count"]),
+                    "display_class_count": DISPLAY_CLASS_COUNT,
+                    "predicted_display_levels": list(record.get("predicted_display_levels", []))[:num_heads],
+                    "predicted_display_scores": list(record.get("predicted_display_scores", []))[:num_heads],
+                    "corrected_display_levels": list(record.get("corrected_display_levels", []))[:num_heads],
                     "seq_len": int(record["seq_len"]),
                     "img_size": int(record["img_size"]),
                 }
@@ -548,6 +796,7 @@ class FeedbackManager:
             "sample_count": len(samples),
             "num_heads": num_heads,
             "class_count": DEFAULT_NUM_CLASSES,
+            "display_class_count": DISPLAY_CLASS_COUNT,
             "latest_feedback_epoch": latest_epoch,
             "samples": samples,
         }

@@ -16,7 +16,13 @@ import tkinter as tk
 from PIL import Image, ImageTk
 
 from user_in_the_loop_training import FeedbackManager
-from utils.affect import AFFECT_COLUMNS, AFFECT_DISPLAY_NAMES, AFFECT_LEVELS
+from utils.affect import (
+    AFFECT_COLUMNS,
+    AFFECT_DISPLAY_NAMES,
+    DISPLAY_AFFECT_LEVELS,
+    display_level_index,
+    infer_display_level,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,11 +43,14 @@ PREVIEW_STAGE_COMPACT_HEIGHT = 336
 ENGAGEMENT_PANEL_HEIGHT = 532
 PRIMARY_DECISION_BOX_HEIGHT = 260
 STAT_BLOCK_HEIGHT = 96
-SPOTLIGHT_BOX_HEIGHT = 132
+SPOTLIGHT_BOX_HEIGHT = 168
 POMODORO_CARD_HEIGHT = 182
 TOP_BAR_STACK_BREAKPOINT = 1240
 MAIN_STACK_BREAKPOINT = 1180
 TILE_MIN_WIDTH = 220
+SCROLL_NOTCH_PIXELS = 72.0
+SCROLL_EASING = 0.42
+SCROLL_FRAME_MS = 12
 
 SPOTLIGHT_THRESHOLD = 0.48
 PRIMARY_CONFIDENCE_THRESHOLD = 0.58
@@ -50,6 +59,8 @@ DISPLAY_BLEND = 0.28
 OUTPUT_HISTORY_WINDOW = 8
 STATE_SWITCH_PATIENCE = 4
 SPOTLIGHT_SWITCH_PATIENCE = 4
+DISPLAY_LEVEL_SWITCH_PATIENCE = 4
+MEDIUM_DISPLAY_SWITCH_PATIENCE = 6
 MIRROR_PREVIEW = True
 CAMERA_READ_FAILURE_PATIENCE = 8
 CAMERA_RECOVERY_DELAY_MS = 180
@@ -105,6 +116,15 @@ HEAD_PALETTES = {
     "confusion": {"accent": COLORS["blue"], "surface": COLORS["blue_soft"]},
     "frustration": {"accent": COLORS["orange"], "surface": COLORS["orange_soft"]},
     "default": {"accent": COLORS["purple"], "surface": COLORS["purple_soft"]},
+}
+
+DISPLAY_LEVEL_SHORT_LABELS = ("VL", "L", "M", "H", "VH")
+INVERSE_DISPLAY_LEVEL_LABELS = {
+    "Very Low": "Very High",
+    "Low": "High",
+    "Medium": "Medium",
+    "High": "Low",
+    "Very High": "Very Low",
 }
 
 STATE_STYLES = {
@@ -380,6 +400,7 @@ class EngagementApp:
         self.output_history: deque[np.ndarray] = deque(maxlen=OUTPUT_HISTORY_WINDOW)
         self.primary_transition = {"current": None, "candidate": None, "count": 0}
         self.spotlight_transition = {"current": None, "candidate": None, "count": 0}
+        self.display_level_transitions: dict[str, dict[str, Any]] = {}
         self.recent_engagement_samples: deque[tuple[float, float]] = deque()
         self.session_engagement_total = 0.0
         self.session_engagement_count = 0
@@ -398,6 +419,8 @@ class EngagementApp:
         self.content_frame: tk.Frame | None = None
         self.layout_after_id: str | None = None
         self.pomodoro_progress_canvas: tk.Canvas | None = None
+        self.scroll_animation_after_id: str | None = None
+        self.scroll_pending_pixels = 0.0
 
         self.pomodoro_active = False
         self.pomodoro_paused = False
@@ -452,6 +475,7 @@ class EngagementApp:
         self.output_history.clear()
         self.primary_transition = {"current": None, "candidate": None, "count": 0}
         self.spotlight_transition = {"current": None, "candidate": None, "count": 0}
+        self.display_level_transitions.clear()
 
     def _idle_engagement_summary_note(self) -> str:
         return "Engagement averages update from smoothed live predictions once the camera is running."
@@ -613,6 +637,78 @@ class EngagementApp:
                 return []
             ordered_specs.append(spec)
         return ordered_specs
+
+    def _display_state_from_probabilities(self, probabilities: np.ndarray | list[float] | tuple[float, ...]) -> dict[str, Any]:
+        inferred = infer_display_level([float(value) for value in probabilities])
+        return {
+            "label": str(inferred["label"]),
+            "index": int(inferred["index"]),
+            "score": float(inferred["score"]),
+            "marker_position": float(inferred["marker_position"]),
+        }
+
+    def _inverse_display_state(self, display_state: dict[str, Any]) -> dict[str, Any]:
+        label = str(display_state["label"])
+        index = int(display_state["index"])
+        score = float(display_state["score"])
+        marker_position = float(display_state["marker_position"])
+        return {
+            "label": INVERSE_DISPLAY_LEVEL_LABELS.get(label, label),
+            "index": max(0, min(len(DISPLAY_AFFECT_LEVELS) - 1, (len(DISPLAY_AFFECT_LEVELS) - 1) - index)),
+            "score": max(0.0, min(4.0, 4.0 - score)),
+            "marker_position": max(0.0, min(1.0, 1.0 - marker_position)),
+        }
+
+    def _stable_display_state(self, key: str, display_state: dict[str, Any]) -> dict[str, Any]:
+        transition = self.display_level_transitions.setdefault(
+            key,
+            {"current": None, "candidate": None, "count": 0, "state": None},
+        )
+        candidate_label = str(display_state["label"])
+        current_label = transition["current"]
+
+        if current_label is None:
+            transition["current"] = candidate_label
+            transition["candidate"] = None
+            transition["count"] = 0
+            transition["state"] = dict(display_state)
+            return dict(display_state)
+
+        if candidate_label == current_label:
+            transition["candidate"] = None
+            transition["count"] = 0
+            transition["state"] = dict(display_state)
+            return dict(display_state)
+
+        if transition["candidate"] == candidate_label:
+            transition["count"] += 1
+        else:
+            transition["candidate"] = candidate_label
+            transition["count"] = 1
+
+        patience = MEDIUM_DISPLAY_SWITCH_PATIENCE if candidate_label == "Medium" else DISPLAY_LEVEL_SWITCH_PATIENCE
+        if transition["count"] >= patience:
+            transition["current"] = candidate_label
+            transition["candidate"] = None
+            transition["count"] = 0
+            transition["state"] = dict(display_state)
+
+        held_state = transition.get("state") or display_state
+        return {
+            "label": str(held_state["label"]),
+            "index": int(held_state["index"]),
+            "score": float(held_state["score"]),
+            "marker_position": float(held_state["marker_position"]),
+        }
+
+    def _stable_display_states(self, output: np.ndarray) -> dict[int, dict[str, Any]]:
+        return {
+            head_index: self._stable_display_state(
+                f"head:{head_index}",
+                self._display_state_from_probabilities(np.asarray(output[head_index], dtype=np.float32)),
+            )
+            for head_index in range(min(self.head_count, int(np.asarray(output).shape[0])))
+        }
 
     def _idle_pomodoro_note(self) -> str:
         if not self.pomodoro_supported:
@@ -809,17 +905,23 @@ class EngagementApp:
             padded.append(padded[-1].copy())
         return padded
 
-    def _derive_internal_rating(self, output: np.ndarray, corrected_labels: list[int | None], known_mask: list[bool]) -> int:
-        predicted_labels = [int(np.argmax(head)) for head in np.asarray(output, dtype=np.float32)]
-        head_distance = max(1, self.class_count - 1)
+    def _derive_internal_rating(self, output: np.ndarray, corrected_display_levels: list[str | None], display_known_mask: list[bool]) -> int:
+        predicted_display_indices = [
+            int(self._display_state_from_probabilities(np.asarray(head, dtype=np.float32))["index"])
+            for head in np.asarray(output, dtype=np.float32)
+        ]
+        head_distance = max(1, len(DISPLAY_AFFECT_LEVELS) - 1)
         agreement_scores: list[float] = []
-        for index, predicted in enumerate(predicted_labels):
-            if index >= len(known_mask) or not known_mask[index]:
+        for index, predicted in enumerate(predicted_display_indices):
+            if index >= len(display_known_mask) or not display_known_mask[index]:
                 continue
-            corrected = corrected_labels[index]
+            corrected = corrected_display_levels[index]
             if corrected is None:
                 continue
-            distance = abs(predicted - int(corrected))
+            corrected_index = display_level_index(corrected)
+            if corrected_index is None:
+                continue
+            distance = abs(predicted - int(corrected_index))
             agreement_scores.append(max(0.0, 1.0 - (distance / head_distance)))
         if not agreement_scores:
             return 3
@@ -933,19 +1035,19 @@ class EngagementApp:
             self._advance_pomodoro_after_checkin(f"Block {block_number} had insufficient live data.")
             return
 
-        corrected_labels: list[int | None] = [None] * self.head_count
-        known_mask: list[bool] = [False] * self.head_count
+        corrected_display_levels: list[str | None] = [None] * self.head_count
+        display_known_mask: list[bool] = [False] * self.head_count
         for spec in self.pomodoro_specs:
             choice = selections[spec["index"]].get()
             if choice == "Not sure":
-                corrected_labels[spec["index"]] = None
-                known_mask[spec["index"]] = False
+                corrected_display_levels[spec["index"]] = None
+                display_known_mask[spec["index"]] = False
             else:
-                corrected_labels[spec["index"]] = AFFECT_LEVELS.index(choice)
-                known_mask[spec["index"]] = True
+                corrected_display_levels[spec["index"]] = choice
+                display_known_mask[spec["index"]] = True
 
         aggregated_output = np.stack([sample for _, sample in self.pomodoro_block_outputs], axis=0).mean(axis=0).astype(np.float32)
-        derived_rating = self._derive_internal_rating(aggregated_output, corrected_labels, known_mask)
+        derived_rating = self._derive_internal_rating(aggregated_output, corrected_display_levels, display_known_mask)
         summary = f"Pomodoro self-check for block {block_number} covering the last {POMODORO_BLOCK_MINUTES} minutes."
         snapshot = self._build_feedback_snapshot(
             frames=self._resample_pomodoro_frames(),
@@ -965,8 +1067,8 @@ class EngagementApp:
         self.feedback_manager.submit_feedback(
             snapshot,
             rating=derived_rating,
-            corrected_labels=corrected_labels,
-            known_mask=known_mask,
+            corrected_display_levels=corrected_display_levels,
+            display_known_mask=display_known_mask,
         )
         self._refresh_feedback_insight()
         if self.running and len(self.output_history) > 0:
@@ -1008,7 +1110,7 @@ class EngagementApp:
             font=("Segoe UI", 10),
         ).pack(anchor="w", pady=(8, 16))
 
-        choice_values = [*AFFECT_LEVELS, "Not sure"]
+        choice_values = [*DISPLAY_AFFECT_LEVELS, "Not sure"]
         selections: dict[int, tk.StringVar] = {}
         for spec in self.pomodoro_specs:
             row = self._create_card(container, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
@@ -1241,7 +1343,63 @@ class EngagementApp:
 
         if steps == 0:
             return
-        self.scroll_canvas.yview_scroll(steps, "units")
+        self._queue_smooth_scroll(steps * SCROLL_NOTCH_PIXELS)
+
+    def _queue_smooth_scroll(self, delta_pixels: float) -> None:
+        if self.scroll_canvas is None:
+            return
+        scroll_region = self.scroll_canvas.bbox("all")
+        if not scroll_region:
+            return
+        if (scroll_region[3] - scroll_region[1]) <= self.scroll_canvas.winfo_height():
+            return
+        self.scroll_pending_pixels += float(delta_pixels)
+        if self.scroll_animation_after_id is None:
+            self.scroll_animation_after_id = self.root.after(SCROLL_FRAME_MS, self._animate_scroll)
+
+    def _scroll_canvas_by_pixels(self, delta_pixels: float) -> None:
+        if self.scroll_canvas is None:
+            return
+        scroll_region = self.scroll_canvas.bbox("all")
+        if not scroll_region:
+            return
+
+        viewport_height = max(1.0, float(self.scroll_canvas.winfo_height()))
+        content_height = max(viewport_height, float(scroll_region[3] - scroll_region[1]))
+        max_offset = max(0.0, content_height - viewport_height)
+        if max_offset <= 0.0:
+            return
+
+        top_fraction = float(self.scroll_canvas.yview()[0])
+        current_offset = top_fraction * max_offset
+        next_offset = max(0.0, min(max_offset, current_offset + float(delta_pixels)))
+        self.scroll_canvas.yview_moveto(next_offset / max_offset)
+
+    def _animate_scroll(self) -> None:
+        self.scroll_animation_after_id = None
+        if self.scroll_canvas is None:
+            self.scroll_pending_pixels = 0.0
+            return
+
+        pending = float(self.scroll_pending_pixels)
+        if abs(pending) < 0.5:
+            self.scroll_pending_pixels = 0.0
+            return
+
+        step = pending * SCROLL_EASING
+        if abs(step) < 1.0:
+            step = 1.0 if pending > 0 else -1.0
+
+        before = self.scroll_canvas.yview()
+        self._scroll_canvas_by_pixels(step)
+        after = self.scroll_canvas.yview()
+        if before == after:
+            self.scroll_pending_pixels = 0.0
+            return
+
+        self.scroll_pending_pixels -= step
+        if abs(self.scroll_pending_pixels) >= 0.5:
+            self.scroll_animation_after_id = self.root.after(SCROLL_FRAME_MS, self._animate_scroll)
 
     def _on_root_configure(self, event) -> None:
         if event.widget is self.root:
@@ -1346,15 +1504,25 @@ class EngagementApp:
         decision_width = max(360, self.decision_card.winfo_width())
         preview_width = max(360, self.preview_card.winfo_width())
         bottom_width = max(360, self.bottom_band.winfo_width())
+        tile_width = max(220, int((self.tiles_frame.winfo_width() or bottom_width) / max(1, len(self.signal_tile_order) or 1)))
 
+        headline_wrap = max(260, decision_width - 72)
+        headline_size = 30 if decision_width >= 560 else 28 if decision_width >= 500 else 26 if decision_width >= 440 else 24
+        confidence_size = 13 if decision_width >= 520 else 12 if decision_width >= 420 else 11
+
+        self.primary_headline_label.configure(wraplength=headline_wrap, font=("Bahnschrift SemiBold", headline_size))
+        self.primary_confidence_label.configure(wraplength=headline_wrap, font=("Segoe UI Semibold", confidence_size))
         self.summary_label.configure(wraplength=max(240, decision_width - 72))
         self.spotlight_detail_label.configure(wraplength=max(240, decision_width - 72))
+        self.spotlight_value.configure(font=("Bahnschrift SemiBold", 18 if decision_width >= 440 else 16))
         self.pomodoro_note_label.configure(wraplength=max(240, decision_width - 72))
         self.preview_footer.configure(wraplength=max(260, preview_width - 40))
         self.bottom_meta_label.configure(wraplength=max(240, bottom_width - 40))
         self.engagement_summary_note_label.configure(wraplength=max(260, bottom_width - 40))
         self.feedback_info_label.configure(wraplength=max(260, bottom_width - 40))
         self.feedback_status_label.configure(wraplength=max(260, bottom_width - 40))
+        for tile in self.signal_tiles.values():
+            tile["detail"].configure(wraplength=max(180, tile_width - 36))
         self.preview_stage.configure(height=PREVIEW_STAGE_COMPACT_HEIGHT if main_stacked else PREVIEW_STAGE_HEIGHT)
         self._on_preview_configure(None)
 
@@ -1403,9 +1571,14 @@ class EngagementApp:
         insight = self.feedback_manager.current_session_insight()
         self.feedback_insight_var.set(
             "Check-ins: "
-            f"{insight['review_count']} logged | "
-            f"{insight['trusted_count']} trusted | "
-            f"Primary {insight['primary_threshold'] * 100:.0f}% | "
+            f"{insight['review_count']} logged, "
+            f"{insight['trusted_count']} trusted, "
+            f"{insight['analytics_only_count']} analytics-only\n"
+            f"Medium: {insight['inferred_medium_heads']} inferred ({insight['inferred_medium_rate'] * 100:.0f}%), "
+            f"{insight['selected_medium_heads']} selected ({insight['selected_medium_rate'] * 100:.0f}%), "
+            f"{insight['trainable_heads']} trainable ({insight['trainable_head_rate'] * 100:.0f}%), "
+            f"{insight['steering_only_heads']} steering-only ({insight['steering_only_head_rate'] * 100:.0f}%), "
+            f"Primary {insight['primary_threshold'] * 100:.0f}%, "
             f"Spotlight {insight['spotlight_threshold'] * 100:.0f}%"
         )
         self.feedback_status_var.set(f"Latest: {insight['last_feedback_status']}")
@@ -1543,8 +1716,28 @@ class EngagementApp:
         self.decision_badge = self._create_chip(self.primary_box, self.status_var.get(), COLORS["panel_soft"])
         self.decision_badge.grid(row=1, column=0, sticky="w", padx=18, pady=(10, 12))
 
-        tk.Label(self.primary_box, textvariable=self.prediction_var, bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 30)).grid(row=2, column=0, sticky="w", padx=18)
-        tk.Label(self.primary_box, textvariable=self.confidence_var, bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 13)).grid(row=3, column=0, sticky="w", padx=18, pady=(4, 6))
+        self.primary_headline_label = tk.Label(
+            self.primary_box,
+            textvariable=self.prediction_var,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            justify="left",
+            anchor="w",
+            wraplength=460,
+            font=("Bahnschrift SemiBold", 30),
+        )
+        self.primary_headline_label.grid(row=2, column=0, sticky="ew", padx=18)
+        self.primary_confidence_label = tk.Label(
+            self.primary_box,
+            textvariable=self.confidence_var,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text_soft"],
+            justify="left",
+            anchor="w",
+            wraplength=460,
+            font=("Segoe UI Semibold", 13),
+        )
+        self.primary_confidence_label.grid(row=3, column=0, sticky="ew", padx=18, pady=(4, 6))
         self.summary_label = tk.Label(
             self.primary_box,
             textvariable=self.summary_var,
@@ -1588,8 +1781,10 @@ class EngagementApp:
             font=("Segoe UI", 10),
         )
         self.spotlight_detail_label.pack(anchor="w", padx=16, pady=(4, 8))
-        self.spotlight_meter = tk.Canvas(self.spotlight_card, height=20, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
-        self.spotlight_meter.pack(fill="x", padx=16, pady=(0, 12))
+        self.spotlight_meter = tk.Canvas(self.spotlight_card, height=16, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+        self.spotlight_meter.pack(fill="x", padx=16, pady=(0, 6))
+        self.spotlight_band = tk.Canvas(self.spotlight_card, height=36, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+        self.spotlight_band.pack(fill="x", padx=16, pady=(0, 12))
 
         self.pomodoro_card = self._create_card(self.decision_body, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
         self.pomodoro_card.grid(row=3, column=0, sticky="ew", pady=(18, 0))
@@ -1703,16 +1898,28 @@ class EngagementApp:
             tk.Label(tile, text=spec["label"], bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=14, pady=(14, 4))
             value = tk.Label(tile, text="50%", bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 24))
             value.pack(anchor="w", padx=14)
-            detail = tk.Label(tile, text="Standby", bg=COLORS["panel_alt"], fg=COLORS["text_muted"], font=("Segoe UI", 9))
+            detail = tk.Label(
+                tile,
+                text="Standby",
+                bg=COLORS["panel_alt"],
+                fg=COLORS["text_muted"],
+                justify="left",
+                anchor="w",
+                wraplength=220,
+                font=("Segoe UI", 9),
+            )
             detail.pack(anchor="w", padx=14, pady=(2, 10))
             meter = tk.Canvas(tile, height=16, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
-            meter.pack(fill="x", padx=14, pady=(0, 14))
+            meter.pack(fill="x", padx=14, pady=(0, 6))
+            band = tk.Canvas(tile, height=34, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+            band.pack(fill="x", padx=14, pady=(0, 14))
             self.signal_tile_order.append(spec["key"])
             self.signal_tiles[spec["key"]] = {
                 "frame": tile,
                 "value": value,
                 "detail": detail,
                 "meter": meter,
+                "band": band,
                 "accent": spec["accent"],
                 "surface": spec["surface"],
                 "head_index": spec.get("head_index"),
@@ -1737,6 +1944,53 @@ class EngagementApp:
 
         if text:
             canvas.create_text(width / 2, height / 2, text=text, fill=COLORS["text"], font=("Segoe UI Semibold", 9))
+
+    def _draw_display_band(
+        self,
+        canvas: tk.Canvas,
+        display_state: dict[str, Any] | None,
+        accent: str,
+        track: str,
+    ) -> None:
+        canvas.delete("all")
+        width = max(120, canvas.winfo_width() or 240)
+        height = max(28, canvas.winfo_height() or 34)
+        label_y = 7
+        band_top = 15
+        band_bottom = max(band_top + 8, height - 10)
+        segment_width = width / len(DISPLAY_AFFECT_LEVELS)
+        muted_label = COLORS["text_muted"]
+        active_index = None if display_state is None else int(display_state["index"])
+
+        for index, label in enumerate(DISPLAY_LEVEL_SHORT_LABELS):
+            x0 = index * segment_width
+            x1 = x0 + segment_width
+            fill = mix_color(track, accent, 0.08 if index == active_index else 0.03)
+            canvas.create_rectangle(x0, band_top, x1, band_bottom, fill=fill, outline=fill)
+            if index > 0:
+                canvas.create_line(x0, band_top, x0, band_bottom, fill=COLORS["border_soft"], width=1)
+            canvas.create_text(
+                (x0 + x1) / 2,
+                label_y,
+                text=label,
+                fill=accent if index == active_index else muted_label,
+                font=("Segoe UI Semibold", 8),
+            )
+
+        canvas.create_rectangle(0, band_top, width, band_bottom, outline=COLORS["border_soft"], width=1)
+        if display_state is None:
+            return
+
+        marker_x = max(4.0, min(width - 4.0, float(display_state["marker_position"]) * width))
+        canvas.create_line(marker_x, band_top - 2, marker_x, band_bottom + 6, fill=accent, width=2)
+        canvas.create_oval(
+            marker_x - 4,
+            band_bottom + 1,
+            marker_x + 4,
+            band_bottom + 9,
+            fill=accent,
+            outline=accent,
+        )
 
     def _draw_primary_meter(self, engaged_score: float, not_engaged_score: float) -> None:
         canvas = self.primary_meter
@@ -1763,7 +2017,7 @@ class EngagementApp:
         canvas.create_text(
             width / 2,
             height / 2,
-            text=f"Engaged {engaged_score * 100:.0f}%   |   Not Engaged {not_engaged_score * 100:.0f}%",
+            text=f"Engaged {engaged_score * 100:.0f}%   Not Engaged {not_engaged_score * 100:.0f}%",
             fill=COLORS["text"],
             font=("Segoe UI Semibold", 10),
         )
@@ -1813,7 +2067,12 @@ class EngagementApp:
             transition["count"] = 0
         return str(transition["current"])
 
-    def _signal_for_key(self, output: np.ndarray, key: str) -> dict[str, Any] | None:
+    def _signal_for_key(
+        self,
+        output: np.ndarray,
+        key: str,
+        display_states: dict[int, dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
         if not key.startswith("head:"):
             return None
         try:
@@ -1830,6 +2089,7 @@ class EngagementApp:
             "elevated": elevated,
             "dominant_level": int(np.argmax(head)),
             "probabilities": head,
+            "display_state": None if display_states is None else display_states.get(head_index),
             "held": True,
         }
 
@@ -1875,45 +2135,83 @@ class EngagementApp:
         self.footer_var.set(footer)
         self._apply_state_palette(state)
 
-    def _binary_detail(self, kind: str, score: float, dominant_level: int) -> str:
-        level = AFFECT_LEVELS[min(dominant_level, len(AFFECT_LEVELS) - 1)]
-        if kind == "engaged":
-            return "High + Very High band" if score >= 0.55 else f"Lead level: {level}"
-        return "Very Low + Low band" if score >= 0.55 else f"Lead level: {level}"
+    def _binary_detail(self, display_state: dict[str, Any]) -> str:
+        return f"Lead level: {display_state['label']}"
 
-    def _spotlight_copy(self, signal: dict[str, Any] | None, spotlight_threshold: float | None = None) -> tuple[str, str, str, float, str]:
+    def _spotlight_copy(
+        self,
+        signal: dict[str, Any] | None,
+        spotlight_threshold: float | None = None,
+    ) -> tuple[str, str, str, float, str, dict[str, Any] | None]:
         if spotlight_threshold is None:
             _, spotlight_threshold = self._effective_thresholds()
         if not self.secondary_specs:
-            return "Secondary Spotlight", "Engagement-only model active", "No secondary affect heads are available in this export.", 0.0, COLORS["text_soft"]
+            return (
+                "Secondary Spotlight",
+                "Engagement-only model active",
+                "No secondary affect heads are available in this export.",
+                0.0,
+                COLORS["text_soft"],
+                None,
+            )
         signal_active = signal is not None and (signal.get("held") or signal["elevated"] >= spotlight_threshold)
         if not signal_active:
-            return "Secondary Spotlight", "Secondary signals stable", "No non-engagement head is above the promotion threshold.", 0.0, COLORS["text_soft"]
+            return (
+                "Secondary Spotlight",
+                "Secondary signals stable",
+                "No non-engagement head is above the promotion threshold.",
+                0.0,
+                COLORS["text_soft"],
+                None,
+            )
         assert signal is not None
         spec = signal["spec"]
-        level = AFFECT_LEVELS[min(signal["dominant_level"], len(AFFECT_LEVELS) - 1)]
+        display_state = signal.get("display_state")
+        level = "Stable" if display_state is None else str(display_state["label"])
         detail_prefix = "Holding trend" if signal.get("held") and signal["elevated"] < spotlight_threshold else "High band"
-        detail = f"{detail_prefix} {signal['elevated'] * 100:.0f}% | Dominant level {level}"
-        return "Secondary Spotlight", f"{spec['label']} rising", detail, float(signal["elevated"]), spec["accent"]
+        detail = f"{detail_prefix} {signal['elevated'] * 100:.0f}%, Dominant level {level}"
+        return "Secondary Spotlight", f"{spec['label']} rising", detail, float(signal["elevated"]), spec["accent"], display_state
 
     def _update_spotlight(self, signal: dict[str, Any] | None, spotlight_threshold: float | None = None) -> None:
-        label, value, detail, meter_value, accent = self._spotlight_copy(signal, spotlight_threshold)
+        label, value, detail, meter_value, accent, display_state = self._spotlight_copy(signal, spotlight_threshold)
         self.spotlight_label_var.set(label)
         self.spotlight_value_var.set(value)
         self.spotlight_detail_var.set(detail)
         self.spotlight_value.configure(fg=accent if meter_value > 0 else COLORS["text"])
         self.spotlight_card.configure(highlightbackground=mix_color(accent, COLORS["border_soft"], 0.35))
         self._draw_capsule(self.spotlight_meter, meter_value, accent, COLORS["panel_soft"])
+        self._draw_display_band(self.spotlight_band, display_state, accent, COLORS["panel_soft"])
 
-    def _update_signal_tiles(self, output: np.ndarray, active_signal: dict[str, Any] | None, spotlight_threshold: float | None = None) -> None:
+    def _update_signal_tiles(
+        self,
+        output: np.ndarray,
+        active_signal: dict[str, Any] | None,
+        display_states: dict[int, dict[str, Any]] | None = None,
+        spotlight_threshold: float | None = None,
+    ) -> None:
         if spotlight_threshold is None:
             _, spotlight_threshold = self._effective_thresholds()
+        if display_states is None:
+            for tile in self.signal_tiles.values():
+                tile["value"].configure(text="--")
+                tile["detail"].configure(text="Waiting for live predictions")
+                tile["frame"].configure(highlightbackground=COLORS["border_soft"])
+                self._draw_capsule(tile["meter"], 0.0, tile["accent"], tile["surface"])
+                self._draw_display_band(tile["band"], None, tile["accent"], tile["surface"])
+            return
+
         engaged, not_engaged, dominant_level = self._engagement_scores(output)
+        engagement_display_state = display_states.get(self.engagement_head_index)
+        if engagement_display_state is None:
+            engagement_display_state = self._display_state_from_probabilities(
+                np.asarray(output[self.engagement_head_index], dtype=np.float32)
+            )
+        not_engagement_display_state = self._inverse_display_state(engagement_display_state)
         engaged_tile = self.signal_tiles.get("engaged")
         not_engaged_tile = self.signal_tiles.get("not_engaged")
-        for tile, score, detail in (
-            (engaged_tile, engaged, self._binary_detail("engaged", engaged, dominant_level)),
-            (not_engaged_tile, not_engaged, self._binary_detail("not_engaged", not_engaged, dominant_level)),
+        for tile, score, detail, display_state in (
+            (engaged_tile, engaged, self._binary_detail(engagement_display_state), engagement_display_state),
+            (not_engaged_tile, not_engaged, self._binary_detail(not_engagement_display_state), not_engagement_display_state),
         ):
             if tile is None:
                 continue
@@ -1922,6 +2220,7 @@ class EngagementApp:
             tile["detail"].configure(text=detail)
             tile["frame"].configure(highlightbackground=mix_color(accent, COLORS["border_soft"], 0.35))
             self._draw_capsule(tile["meter"], score, accent, tile["surface"])
+            self._draw_display_band(tile["band"], display_state, accent, tile["surface"])
 
         active_key = None
         if active_signal is not None and (active_signal.get("held") or active_signal["elevated"] >= spotlight_threshold):
@@ -1932,20 +2231,29 @@ class EngagementApp:
                 continue
             head = output[spec["index"]]
             elevated = float(sum(head[idx] for idx in self.positive_class_indices if idx < len(head)))
-            dominant = AFFECT_LEVELS[min(int(np.argmax(head)), len(AFFECT_LEVELS) - 1)]
+            display_state = display_states.get(spec["index"])
+            if display_state is None:
+                display_state = self._display_state_from_probabilities(np.asarray(head, dtype=np.float32))
             tile["value"].configure(text=f"{elevated * 100:.0f}%")
-            tile["detail"].configure(text=f"{dominant} tendency")
+            tile["detail"].configure(text=f"{display_state['label']} tendency")
             border = spec["accent"] if active_key == f"head:{spec['index']}" else mix_color(spec["accent"], COLORS["border_soft"], 0.35)
             tile["frame"].configure(highlightbackground=border)
             self._draw_capsule(tile["meter"], elevated, spec["accent"], spec["surface"])
+            self._draw_display_band(tile["band"], display_state, spec["accent"], spec["surface"])
 
     def _update_primary_view(self, output: np.ndarray) -> None:
         primary_threshold, spotlight_threshold = self._effective_thresholds()
         engaged, not_engaged, dominant_level = self._engagement_scores(output)
+        display_states = self._stable_display_states(output)
+        engagement_display_state = display_states.get(self.engagement_head_index)
+        if engagement_display_state is None:
+            engagement_display_state = self._display_state_from_probabilities(
+                np.asarray(output[self.engagement_head_index], dtype=np.float32)
+            )
         self.engaged_block["value"].configure(text=f"{engaged * 100:.0f}%")
-        self.engaged_block["detail"].configure(text=self._binary_detail("engaged", engaged, dominant_level))
+        self.engaged_block["detail"].configure(text=self._binary_detail(engagement_display_state))
         self.not_engaged_block["value"].configure(text=f"{not_engaged * 100:.0f}%")
-        self.not_engaged_block["detail"].configure(text=self._binary_detail("not_engaged", not_engaged, dominant_level))
+        self.not_engaged_block["detail"].configure(text=self._binary_detail(self._inverse_display_state(engagement_display_state)))
         self._draw_primary_meter(engaged, not_engaged)
 
         primary_confidence = max(engaged, not_engaged)
@@ -1957,7 +2265,7 @@ class EngagementApp:
         else:
             spotlight_key = "stable"
         stable_spotlight_key = self._stable_choice(self.spotlight_transition, spotlight_key, SPOTLIGHT_SWITCH_PATIENCE)
-        active_signal = self._signal_for_key(output, stable_spotlight_key)
+        active_signal = self._signal_for_key(output, stable_spotlight_key, display_states)
         spotlight_active = active_signal is not None
 
         if primary_confidence < primary_threshold and spotlight_active:
@@ -1971,14 +2279,14 @@ class EngagementApp:
         headline, summary = self._primary_copy(state, active_signal)
 
         confidence = (
-            f"{primary_confidence * 100:.0f}% window confidence | "
-            f"Primary threshold {primary_threshold * 100:.0f}% | "
-            f"Dominant level {AFFECT_LEVELS[dominant_level]}"
+            f"{primary_confidence * 100:.0f}% window confidence, "
+            f"Primary threshold {primary_threshold * 100:.0f}%, "
+            f"Dominant level {engagement_display_state['label']}"
         )
         footer = "Live monitoring active. Secondary tiles refresh from the current frame window."
         self._set_state(state, headline, confidence, summary, footer, preview_badge="Live")
         self._update_spotlight(active_signal, spotlight_threshold)
-        self._update_signal_tiles(output, active_signal, spotlight_threshold)
+        self._update_signal_tiles(output, active_signal, display_states, spotlight_threshold)
 
     def _draw_preview_placeholder(self) -> None:
         self.preview_label.configure(
@@ -2266,6 +2574,10 @@ class EngagementApp:
 
     def on_close(self) -> None:
         self.closing = True
+        if self.scroll_animation_after_id is not None:
+            self.root.after_cancel(self.scroll_animation_after_id)
+            self.scroll_animation_after_id = None
+        self.scroll_pending_pixels = 0.0
         self._close_checkin_dialog()
         self.stop()
         self.root.destroy()
