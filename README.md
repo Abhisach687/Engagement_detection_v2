@@ -108,7 +108,9 @@ App behavior:
 - Otherwise it falls back to the original engagement-only distilled student.
 - If the required ONNX export is missing, the app tries to export it automatically from the saved PyTorch or TorchScript checkpoint.
 - The GUI shows the active device (`cuda` or `cpu`) and the active model variant.
-- The desktop UI opens in a split-screen-friendly layout, supports mouse-wheel and trackpad scrolling, and includes a live preview, engagement decision panel, rolling summaries, and a Pomodoro timer card.
+- The desktop UI opens in a split-screen-friendly layout, supports mouse-wheel and trackpad scrolling, and includes a live preview, engagement decision panel, rolling summaries, a 24-minute Pomodoro card, and a standalone 8-minute mindfulness timer.
+- The lower summary area now includes a learning suggestion line that adapts to the current engagement state and the strongest secondary signal when live monitoring is active.
+- The mindfulness timer rotates short prompts during its 8-minute run and does not depend on the camera or feedback pipeline.
 - When the multi-affect ONNX sidecar metadata is present, the app derives the secondary affect tiles from `head_names` and uses the feedback-adjusted spotlight threshold shown in the UI.
 - After enough check-ins are collected, the app adjusts its live primary and spotlight thresholds from user feedback without changing model weights in-session.
 
@@ -127,6 +129,12 @@ Then use the feedback loop like this:
 4. When the self-check opens, answer how engaged, bored, confused, and frustrated you felt in the last 8 minutes.
 5. Submit the check-in, skip it, or stop the Pomodoro.
 6. Repeat for all three 8-minute blocks in the 24-minute session.
+
+Mindfulness companion flow:
+
+1. Click `Start Mindfulness` whenever you want a standalone 8-minute reset.
+2. Follow the prompt shown in the mindfulness card as the timer advances through breathing, body-scan, and return-to-work guidance.
+3. Click `Stop Mindfulness` to end the reset early, or let it finish and return to work with one calm intention.
 
 What happens after submission:
 - The corresponding Pomodoro frame window is saved under `cache/user_feedback/clips/`.

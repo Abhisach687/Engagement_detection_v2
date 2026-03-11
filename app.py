@@ -23,6 +23,18 @@ from utils.affect import (
     display_level_index,
     infer_display_level,
 )
+from utils.guidance import (
+    AffectProfile,
+    MINDFULNESS_TOTAL_SECONDS,
+    POMODORO_BLOCK_MINUTES,
+    POMODORO_BLOCK_SECONDS,
+    POMODORO_TOTAL_SECONDS,
+    format_clock,
+    mindfulness_guidance_for_profile,
+    mindfulness_timer_view,
+    pomodoro_guidance_for_profile,
+    pomodoro_timer_view,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -43,14 +55,28 @@ PREVIEW_STAGE_COMPACT_HEIGHT = 336
 ENGAGEMENT_PANEL_HEIGHT = 532
 PRIMARY_DECISION_BOX_HEIGHT = 260
 STAT_BLOCK_HEIGHT = 96
-SPOTLIGHT_BOX_HEIGHT = 168
+SPOTLIGHT_BOX_HEIGHT = 182
 POMODORO_CARD_HEIGHT = 182
+MINDFULNESS_CARD_HEIGHT = 182
 TOP_BAR_STACK_BREAKPOINT = 1240
 MAIN_STACK_BREAKPOINT = 1180
+TIMER_STACK_BREAKPOINT = 980
 TILE_MIN_WIDTH = 220
-SCROLL_NOTCH_PIXELS = 72.0
-SCROLL_EASING = 0.42
-SCROLL_FRAME_MS = 12
+SCROLL_NOTCH_PIXELS = 36.0
+SCROLL_EASING = 0.32
+SCROLL_FRAME_MS = 8
+SCROLL_MIN_STEP_PIXELS = 0.5
+LAYOUT_DEBOUNCE_MS = 60
+PREVIEW_REFRESH_DEBOUNCE_MS = 16
+PREVIEW_RESIZE_EPSILON = 6
+LAYOUT_HYSTERESIS = 48
+PREVIEW_RENDER_INTERVAL_SEC = 1.0 / 24.0
+PANEL_RENDER_INTERVAL_SEC = 0.0
+INTERACTION_COOLDOWN_SEC = 0.14
+SIGNAL_TILE_HEIGHT = 168
+UI_UPDATE_INTERVAL_MS = 50
+PREVIEW_UPDATE_INTERVAL_SEC = 1.0 / 24.0
+WARMING_STATUS_STEP = 5
 
 SPOTLIGHT_THRESHOLD = 0.48
 PRIMARY_CONFIDENCE_THRESHOLD = 0.58
@@ -68,9 +94,7 @@ INFERENCE_STALE_FRAME_TOLERANCE = 18
 SUMMARY_WINDOWS_MINUTES = (4, 8)
 SUMMARY_MAX_WINDOW_SEC = SUMMARY_WINDOWS_MINUTES[-1] * 60
 POMODORO_TOTAL_MINUTES = 24
-POMODORO_BLOCK_MINUTES = 8
-POMODORO_TOTAL_SECONDS = POMODORO_TOTAL_MINUTES * 60
-POMODORO_BLOCK_SECONDS = POMODORO_BLOCK_MINUTES * 60
+MINDFULNESS_TOTAL_MINUTES = 8
 POMODORO_FRAME_SAMPLE_INTERVAL_SEC = 4.0
 POMODORO_FEEDBACK_SOURCE = "pomodoro_checkin"
 
@@ -418,9 +442,29 @@ class EngagementApp:
         self.scroll_canvas_window: int | None = None
         self.content_frame: tk.Frame | None = None
         self.layout_after_id: str | None = None
+        self.timer_cards_stacked = False
         self.pomodoro_progress_canvas: tk.Canvas | None = None
+        self.mindfulness_progress_canvas: tk.Canvas | None = None
         self.scroll_animation_after_id: str | None = None
+        self.scroll_target_offset = 0.0
         self.scroll_pending_pixels = 0.0
+        self.last_scroll_canvas_size = (0, 0)
+        self.last_root_size = (0, 0)
+        self.last_preview_update_monotonic = 0.0
+        self.last_warming_status_buffered = -1
+        self.top_bar_layout_compact: bool | None = None
+        self.control_buttons_compact: bool | None = None
+        self.main_area_layout_stacked: bool | None = None
+        self.timer_row_layout_stacked: bool | None = None
+        self.bottom_header_layout_compact: bool | None = None
+        self.signal_tile_layout_columns: int | None = None
+        self.top_chip_layout_columns: int | None = None
+        self.preview_refresh_after_id: str | None = None
+        self.preview_last_size = (0, 0)
+        self.preview_requested_size = (0, 0)
+        self.last_preview_render_at = 0.0
+        self.last_panel_render_at = 0.0
+        self.interaction_busy_until = 0.0
 
         self.pomodoro_active = False
         self.pomodoro_paused = False
@@ -438,6 +482,19 @@ class EngagementApp:
         self.pomodoro_status_reason = ""
         self.pomodoro_block_outputs: list[tuple[float, np.ndarray]] = []
         self.pomodoro_block_frames: list[tuple[float, np.ndarray]] = []
+        self.mindfulness_active = False
+        self.mindfulness_remaining_seconds = float(MINDFULNESS_TOTAL_SECONDS)
+        self.mindfulness_elapsed_seconds = 0.0
+        self.mindfulness_last_tick_monotonic: float | None = None
+        self.mindfulness_phase = "idle"
+        self.mindfulness_status_reason = ""
+        self.latest_affect_profile = AffectProfile(
+            state="idle",
+            engagement_label=None,
+            boredom_label=None,
+            confusion_label=None,
+            frustration_label=None,
+        )
 
         self.status_var = tk.StringVar(value=STATE_STYLES["idle"]["badge"])
         self.preview_badge_var = tk.StringVar(value="Idle")
@@ -452,11 +509,19 @@ class EngagementApp:
         self.feedback_insight_var = tk.StringVar(value="")
         self.feedback_status_var = tk.StringVar(value="")
         self.engagement_summary_note_var = tk.StringVar(value=self._idle_engagement_summary_note())
+        self.learning_suggestion_var = tk.StringVar(
+            value=f"Learning suggestion: {pomodoro_guidance_for_profile(self.latest_affect_profile).body}"
+        )
         self.pomodoro_status_var = tk.StringVar(value="")
         self.pomodoro_time_var = tk.StringVar(value="")
         self.pomodoro_block_var = tk.StringVar(value="")
         self.pomodoro_next_var = tk.StringVar(value="")
         self.pomodoro_note_var = tk.StringVar(value="")
+        self.mindfulness_status_var = tk.StringVar(value="")
+        self.mindfulness_time_var = tk.StringVar(value="")
+        self.mindfulness_block_var = tk.StringVar(value="")
+        self.mindfulness_next_var = tk.StringVar(value="")
+        self.mindfulness_note_var = tk.StringVar(value="")
 
         self._set_initial_window()
         self._build_root_scaffold()
@@ -464,18 +529,63 @@ class EngagementApp:
         self._refresh_feedback_insight()
         self._reset_engagement_summary()
         self._reset_pomodoro_state()
+        self._reset_mindfulness_state()
         self._update_spotlight(None)
         self._update_signal_tiles(self.display_output, None)
         self._apply_state_palette("idle")
         self._sync_control_states()
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self.root.after_idle(self._apply_responsive_layout)
+        self._schedule_ui()
 
     def _reset_temporal_smoothing(self) -> None:
         self.output_history.clear()
         self.primary_transition = {"current": None, "candidate": None, "count": 0}
         self.spotlight_transition = {"current": None, "candidate": None, "count": 0}
         self.display_level_transitions.clear()
+
+    def _fallback_affect_profile(self, state: str | None = None) -> AffectProfile:
+        return AffectProfile(
+            state=state or self.state,
+            engagement_label=None,
+            boredom_label=None,
+            confusion_label=None,
+            frustration_label=None,
+        )
+
+    def _affect_profile_from_display_states(
+        self,
+        state: str,
+        display_states: dict[int, dict[str, Any]] | None = None,
+    ) -> AffectProfile:
+        if not display_states:
+            return self._fallback_affect_profile(state)
+
+        labels: dict[str, str | None] = {
+            "engagement": None,
+            "boredom": None,
+            "confusion": None,
+            "frustration": None,
+        }
+        for spec in self.head_specs:
+            key = _normalize_head_name(spec["name"])
+            if key not in labels:
+                continue
+            display_state = display_states.get(spec["index"])
+            labels[key] = None if display_state is None else str(display_state["label"])
+
+        return AffectProfile(
+            state=state,
+            engagement_label=labels["engagement"],
+            boredom_label=labels["boredom"],
+            confusion_label=labels["confusion"],
+            frustration_label=labels["frustration"],
+        )
+
+    def _refresh_learning_suggestion(self, profile: AffectProfile | None = None) -> None:
+        resolved_profile = self.latest_affect_profile if profile is None else profile
+        suggestion = pomodoro_guidance_for_profile(resolved_profile)
+        self.learning_suggestion_var.set(f"Learning suggestion: {suggestion.body}")
 
     def _idle_engagement_summary_note(self) -> str:
         return "Engagement averages update from smoothed live predictions once the camera is running."
@@ -716,9 +826,7 @@ class EngagementApp:
         return "Start Pomodoro to begin a 24-minute focus block with self-checks every 8 minutes."
 
     def _format_clock(self, seconds: float) -> str:
-        total_seconds = max(0, int(round(seconds)))
-        minutes, remainder = divmod(total_seconds, 60)
-        return f"{minutes:02d}:{remainder:02d}"
+        return format_clock(seconds)
 
     def _reset_pomodoro_block_capture(self, start_epoch: float | None = None) -> None:
         self.pomodoro_block_outputs.clear()
@@ -741,6 +849,15 @@ class EngagementApp:
         self._reset_pomodoro_block_capture()
         self.pomodoro_phase = phase or ("idle" if self.pomodoro_supported else "unavailable")
         self._refresh_pomodoro_ui()
+
+    def _reset_mindfulness_state(self, *, phase: str = "idle", reason: str = "") -> None:
+        self.mindfulness_active = False
+        self.mindfulness_remaining_seconds = float(MINDFULNESS_TOTAL_SECONDS)
+        self.mindfulness_elapsed_seconds = 0.0
+        self.mindfulness_last_tick_monotonic = None
+        self.mindfulness_phase = phase
+        self.mindfulness_status_reason = reason
+        self._refresh_mindfulness_ui()
 
     def _draw_pomodoro_progress(self, completed_blocks: int, current_progress: float, accent: str) -> None:
         if self.pomodoro_progress_canvas is None:
@@ -777,83 +894,89 @@ class EngagementApp:
             )
 
     def _refresh_pomodoro_ui(self) -> None:
-        if not self.pomodoro_supported:
-            status = "Unavailable"
-            time_text = self._format_clock(POMODORO_TOTAL_SECONDS)
-            block_text = "Needs multi-affect model"
-            next_text = "Engagement-only runtime cannot open 4-head self-checks."
-            note_text = self.pomodoro_status_reason or self._idle_pomodoro_note()
-            accent = COLORS["text_soft"]
-            surface = COLORS["panel_soft"]
-            completed_blocks = 0
-            current_progress = 0.0
-        elif self.pomodoro_phase == "running":
-            block_remaining = max(0.0, POMODORO_BLOCK_SECONDS - self.pomodoro_block_elapsed_seconds)
-            status = "Focus Live"
-            time_text = self._format_clock(self.pomodoro_remaining_seconds)
-            block_text = f"Block {self.pomodoro_current_block_index + 1}/3"
-            next_text = f"Next check-in in {self._format_clock(block_remaining)}"
-            note_text = "Live monitoring stays on while the timer runs. The timer pauses during each self-check."
+        guidance = pomodoro_guidance_for_profile(self.latest_affect_profile)
+        view = pomodoro_timer_view(
+            supported=self.pomodoro_supported,
+            phase=self.pomodoro_phase,
+            remaining_seconds=self.pomodoro_remaining_seconds,
+            block_elapsed_seconds=self.pomodoro_block_elapsed_seconds,
+            completed_blocks=self.pomodoro_completed_blocks,
+            current_block_index=self.pomodoro_current_block_index,
+            status_reason=self.pomodoro_status_reason,
+            guidance=guidance,
+        )
+        status = view.status
+        self.pomodoro_status_var.set(view.status)
+        self.pomodoro_time_var.set(view.time_text)
+        self.pomodoro_block_var.set(view.block_text)
+        self.pomodoro_next_var.set(view.next_text)
+        self.pomodoro_note_var.set(view.note_text)
+
+        if self.pomodoro_phase == "running":
             accent = COLORS["blue"]
             surface = COLORS["blue_soft"]
-            completed_blocks = self.pomodoro_completed_blocks
-            current_progress = self.pomodoro_block_elapsed_seconds / POMODORO_BLOCK_SECONDS
         elif self.pomodoro_phase == "paused":
-            status = "Check-In"
-            time_text = self._format_clock(self.pomodoro_remaining_seconds)
-            block_text = f"Block {self.pomodoro_current_block_index + 1}/3 complete"
-            next_text = f"Review the last {POMODORO_BLOCK_MINUTES} minutes to continue."
-            note_text = "Answer how engaged, bored, confused, and frustrated you felt. The next block starts after submit or skip."
             accent = COLORS["amber"]
             surface = COLORS["amber_soft"]
-            completed_blocks = self.pomodoro_completed_blocks
-            current_progress = 1.0
         elif self.pomodoro_phase == "complete":
-            status = "Complete"
-            time_text = self._format_clock(0)
-            block_text = "3 blocks finished"
-            next_text = "The 24-minute Pomodoro is complete."
-            note_text = self.pomodoro_status_reason or "Three 8-minute self-check windows were captured for learning."
             accent = COLORS["green"]
             surface = COLORS["green_soft"]
-            completed_blocks = 3
-            current_progress = 0.0
         elif self.pomodoro_phase == "stopped":
-            status = "Stopped"
-            time_text = self._format_clock(self.pomodoro_remaining_seconds)
-            block_text = "Pomodoro ended early"
-            next_text = "Start again for a fresh 24-minute block."
-            note_text = self.pomodoro_status_reason or "Pomodoro stopped before the third self-check."
             accent = COLORS["red"]
             surface = COLORS["red_soft"]
-            completed_blocks = 0
-            current_progress = 0.0
         else:
-            status = "Idle"
-            time_text = self._format_clock(POMODORO_TOTAL_SECONDS)
-            block_text = "Block 1/3"
-            next_text = f"Next check-in in {self._format_clock(POMODORO_BLOCK_SECONDS)}"
-            note_text = self.pomodoro_status_reason or self._idle_pomodoro_note()
             accent = COLORS["text_soft"]
             surface = COLORS["panel_soft"]
-            completed_blocks = 0
-            current_progress = 0.0
-
-        self.pomodoro_status_var.set(status)
-        self.pomodoro_time_var.set(time_text)
-        self.pomodoro_block_var.set(block_text)
-        self.pomodoro_next_var.set(next_text)
-        self.pomodoro_note_var.set(note_text)
 
         if hasattr(self, "pomodoro_chip"):
             self.pomodoro_chip.configure(text=status, bg=surface, fg=accent)
         if hasattr(self, "pomodoro_card"):
             self.pomodoro_card.configure(highlightbackground=mix_color(accent, COLORS["border_soft"], 0.35))
-        self._draw_pomodoro_progress(completed_blocks, current_progress, accent)
+        self._draw_pomodoro_progress(view.completed_blocks, view.current_progress, accent)
+
+    def _refresh_mindfulness_ui(self) -> None:
+        guidance = mindfulness_guidance_for_profile(
+            self.latest_affect_profile,
+            elapsed_seconds=self.mindfulness_elapsed_seconds,
+            phase=self.mindfulness_phase,
+        )
+        view = mindfulness_timer_view(
+            phase=self.mindfulness_phase,
+            remaining_seconds=self.mindfulness_remaining_seconds,
+            elapsed_seconds=self.mindfulness_elapsed_seconds,
+            status_reason=self.mindfulness_status_reason,
+            guidance=guidance,
+        )
+        self.mindfulness_status_var.set(view.status)
+        self.mindfulness_time_var.set(view.time_text)
+        self.mindfulness_block_var.set(view.block_text)
+        self.mindfulness_next_var.set(view.next_text)
+        self.mindfulness_note_var.set(view.note_text)
+
+        if self.mindfulness_phase == "running":
+            accent = COLORS["green"]
+            surface = COLORS["green_soft"]
+        elif self.mindfulness_phase == "complete":
+            accent = COLORS["blue"]
+            surface = COLORS["blue_soft"]
+        elif self.mindfulness_phase == "stopped":
+            accent = COLORS["red"]
+            surface = COLORS["red_soft"]
+        else:
+            accent = COLORS["text_soft"]
+            surface = COLORS["panel_soft"]
+
+        if hasattr(self, "mindfulness_chip"):
+            self.mindfulness_chip.configure(text=view.status, bg=surface, fg=accent)
+        if hasattr(self, "mindfulness_card"):
+            self.mindfulness_card.configure(highlightbackground=mix_color(accent, COLORS["border_soft"], 0.35))
+        if self.mindfulness_progress_canvas is not None:
+            self._draw_capsule(self.mindfulness_progress_canvas, view.progress, accent, COLORS["panel_soft"])
 
     def _sync_control_states(self) -> None:
+        camera_live = bool(self.running)
         if hasattr(self, "start_button"):
-            if self.running:
+            if camera_live:
                 self.start_button.configure(state="disabled")
                 self.stop_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
             else:
@@ -864,15 +987,26 @@ class EngagementApp:
             return
 
         pomodoro_open = self.pomodoro_active or self.checkin_dialog is not None
-        if self.pomodoro_supported and not pomodoro_open:
+        if camera_live and self.pomodoro_supported and not pomodoro_open:
             self.start_pomodoro_button.configure(state="normal", bg=COLORS["blue_soft"], fg=COLORS["blue"])
         else:
             self.start_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
 
-        if pomodoro_open:
+        if camera_live and pomodoro_open:
             self.stop_pomodoro_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
         else:
             self.stop_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
+
+        if camera_live and self.mindfulness_active:
+            self.start_mindfulness_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
+            self.stop_mindfulness_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
+        else:
+            self.start_mindfulness_button.configure(
+                state="normal" if camera_live else "disabled",
+                bg=COLORS["green_soft"] if camera_live else COLORS["panel_soft"],
+                fg=COLORS["green"] if camera_live else COLORS["text_soft"],
+            )
+            self.stop_mindfulness_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
 
     def _record_pomodoro_frame_sample(self, frame: np.ndarray, timestamp: float | None = None) -> None:
         if not self.pomodoro_active or self.pomodoro_paused or not self.pomodoro_supported:
@@ -1222,6 +1356,32 @@ class EngagementApp:
 
         self._refresh_pomodoro_ui()
 
+    def _update_mindfulness_timer(self) -> None:
+        if not self.mindfulness_active:
+            return
+
+        now = time.monotonic()
+        if self.mindfulness_last_tick_monotonic is None:
+            self.mindfulness_last_tick_monotonic = now
+        delta = max(0.0, now - self.mindfulness_last_tick_monotonic)
+        self.mindfulness_last_tick_monotonic = now
+        if delta <= 0.0:
+            self._refresh_mindfulness_ui()
+            return
+
+        self.mindfulness_remaining_seconds = max(0.0, self.mindfulness_remaining_seconds - delta)
+        self.mindfulness_elapsed_seconds = min(float(MINDFULNESS_TOTAL_SECONDS), self.mindfulness_elapsed_seconds + delta)
+        self.mindfulness_phase = "running"
+        if self.mindfulness_elapsed_seconds >= float(MINDFULNESS_TOTAL_SECONDS):
+            self.mindfulness_active = False
+            self.mindfulness_phase = "complete"
+            self.mindfulness_remaining_seconds = 0.0
+            self.mindfulness_elapsed_seconds = float(MINDFULNESS_TOTAL_SECONDS)
+            self.mindfulness_last_tick_monotonic = None
+            self.mindfulness_status_reason = "The 8-minute mindfulness reset is complete."
+            self._sync_control_states()
+        self._refresh_mindfulness_ui()
+
     def start_pomodoro(self) -> None:
         if not self.pomodoro_supported:
             self.feedback_status_var.set("Latest: Pomodoro check-ins need the multi-affect model.")
@@ -1230,9 +1390,9 @@ class EngagementApp:
         if self.pomodoro_active or self.checkin_dialog is not None:
             return
         if not self.running:
-            self.start()
-            if not self.running:
-                return
+            self.feedback_status_var.set("Latest: Start the camera before starting Pomodoro.")
+            self._sync_control_states()
+            return
 
         self.pomodoro_active = True
         self.pomodoro_paused = False
@@ -1256,10 +1416,33 @@ class EngagementApp:
         self._close_checkin_dialog()
         self._reset_pomodoro_state(phase="stopped", reason="Pomodoro stopped. Start again for a fresh 24-minute focus block.")
         self.feedback_status_var.set("Latest: Pomodoro stopped before completion.")
-        if self.running:
-            self.stop()
-        else:
+        self._sync_control_states()
+
+    def start_mindfulness(self) -> None:
+        if not self.running:
+            self.feedback_status_var.set("Latest: Start the camera before starting Mindfulness.")
             self._sync_control_states()
+            return
+        if self.mindfulness_active:
+            return
+        self.mindfulness_active = True
+        self.mindfulness_phase = "running"
+        self.mindfulness_remaining_seconds = float(MINDFULNESS_TOTAL_SECONDS)
+        self.mindfulness_elapsed_seconds = 0.0
+        self.mindfulness_last_tick_monotonic = time.monotonic()
+        self.mindfulness_status_reason = ""
+        self._refresh_mindfulness_ui()
+        self._sync_control_states()
+
+    def stop_mindfulness(self) -> None:
+        if not self.mindfulness_active:
+            return
+        self.mindfulness_active = False
+        self.mindfulness_phase = "stopped"
+        self.mindfulness_last_tick_monotonic = None
+        self.mindfulness_status_reason = "Mindfulness timer stopped before the full 8-minute reset."
+        self._refresh_mindfulness_ui()
+        self._sync_control_states()
 
     def _set_initial_window(self) -> None:
         self.root.title("Live Engagement Monitor")
@@ -1302,6 +1485,10 @@ class EngagementApp:
     def _on_scroll_canvas_configure(self, event) -> None:
         if self.scroll_canvas is None or self.scroll_canvas_window is None:
             return
+        size = (int(event.width), int(event.height))
+        if size == self.last_scroll_canvas_size:
+            return
+        self.last_scroll_canvas_size = size
         self.scroll_canvas.itemconfigure(self.scroll_canvas_window, width=event.width)
         self._schedule_responsive_layout()
 
@@ -1310,7 +1497,7 @@ class EngagementApp:
             return
         self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
 
-    def _on_mousewheel(self, event) -> None:
+    def _on_mousewheel(self, event):
         if self.scroll_canvas is None:
             return
         if self.checkin_dialog is not None:
@@ -1328,87 +1515,124 @@ class EngagementApp:
         if (scroll_region[3] - scroll_region[1]) <= self.scroll_canvas.winfo_height():
             return
 
-        steps = 0
+        delta_pixels = 0.0
         delta = getattr(event, "delta", 0)
         if delta:
-            steps = -int(delta / 120)
-            if steps == 0:
-                steps = -1 if delta > 0 else 1
+            delta_pixels = -(float(delta) / 120.0) * SCROLL_NOTCH_PIXELS
         else:
             event_num = getattr(event, "num", None)
             if event_num == 4:
-                steps = -1
+                delta_pixels = -SCROLL_NOTCH_PIXELS
             elif event_num == 5:
-                steps = 1
+                delta_pixels = SCROLL_NOTCH_PIXELS
 
-        if steps == 0:
+        if abs(delta_pixels) < 0.1:
             return
-        self._queue_smooth_scroll(steps * SCROLL_NOTCH_PIXELS)
+        self._queue_smooth_scroll(delta_pixels)
+        return "break"
 
     def _queue_smooth_scroll(self, delta_pixels: float) -> None:
         if self.scroll_canvas is None:
             return
-        scroll_region = self.scroll_canvas.bbox("all")
-        if not scroll_region:
+        current_offset, max_offset = self._scroll_offsets()
+        if current_offset is None or max_offset <= 0.0:
             return
-        if (scroll_region[3] - scroll_region[1]) <= self.scroll_canvas.winfo_height():
-            return
-        self.scroll_pending_pixels += float(delta_pixels)
+        if self.scroll_animation_after_id is None:
+            self.scroll_target_offset = current_offset
+        self.scroll_target_offset = max(0.0, min(max_offset, self.scroll_target_offset + float(delta_pixels)))
+        self._mark_ui_interaction()
         if self.scroll_animation_after_id is None:
             self.scroll_animation_after_id = self.root.after(SCROLL_FRAME_MS, self._animate_scroll)
 
-    def _scroll_canvas_by_pixels(self, delta_pixels: float) -> None:
+    def _scroll_offsets(self) -> tuple[float | None, float]:
         if self.scroll_canvas is None:
-            return
+            return None, 0.0
         scroll_region = self.scroll_canvas.bbox("all")
         if not scroll_region:
-            return
+            return None, 0.0
 
         viewport_height = max(1.0, float(self.scroll_canvas.winfo_height()))
         content_height = max(viewport_height, float(scroll_region[3] - scroll_region[1]))
         max_offset = max(0.0, content_height - viewport_height)
         if max_offset <= 0.0:
-            return
+            return 0.0, 0.0
 
         top_fraction = float(self.scroll_canvas.yview()[0])
         current_offset = top_fraction * max_offset
+        return current_offset, max_offset
+
+    def _scroll_canvas_by_pixels(self, delta_pixels: float) -> bool:
+        current_offset, max_offset = self._scroll_offsets()
+        if current_offset is None or max_offset <= 0.0:
+            return False
         next_offset = max(0.0, min(max_offset, current_offset + float(delta_pixels)))
         self.scroll_canvas.yview_moveto(next_offset / max_offset)
+        return True
 
     def _animate_scroll(self) -> None:
         self.scroll_animation_after_id = None
         if self.scroll_canvas is None:
             self.scroll_pending_pixels = 0.0
+            self.scroll_target_offset = 0.0
             return
 
-        pending = float(self.scroll_pending_pixels)
-        if abs(pending) < 0.5:
+        current_offset, max_offset = self._scroll_offsets()
+        if current_offset is None or max_offset <= 0.0:
             self.scroll_pending_pixels = 0.0
+            self.scroll_target_offset = 0.0
             return
 
-        step = pending * SCROLL_EASING
-        if abs(step) < 1.0:
-            step = 1.0 if pending > 0 else -1.0
+        self.scroll_target_offset = max(0.0, min(max_offset, self.scroll_target_offset))
+        remaining = self.scroll_target_offset - current_offset
+        if abs(remaining) < 0.6:
+            if max_offset > 0.0:
+                self.scroll_canvas.yview_moveto(self.scroll_target_offset / max_offset)
+            self.scroll_pending_pixels = 0.0
+            self.scroll_target_offset = current_offset if max_offset <= 0.0 else self.scroll_target_offset
+            return
+
+        step = remaining * SCROLL_EASING
+        step = max(-SCROLL_NOTCH_PIXELS, min(SCROLL_NOTCH_PIXELS, step))
+        if abs(step) < SCROLL_MIN_STEP_PIXELS:
+            step = SCROLL_MIN_STEP_PIXELS if remaining > 0 else -SCROLL_MIN_STEP_PIXELS
 
         before = self.scroll_canvas.yview()
-        self._scroll_canvas_by_pixels(step)
+        moved = self._scroll_canvas_by_pixels(step)
         after = self.scroll_canvas.yview()
-        if before == after:
+        if not moved or before == after:
             self.scroll_pending_pixels = 0.0
+            self.scroll_target_offset = current_offset
             return
-
-        self.scroll_pending_pixels -= step
-        if abs(self.scroll_pending_pixels) >= 0.5:
-            self.scroll_animation_after_id = self.root.after(SCROLL_FRAME_MS, self._animate_scroll)
+        self.scroll_pending_pixels = self.scroll_target_offset - (self._scroll_offsets()[0] or 0.0)
+        self.scroll_animation_after_id = self.root.after(SCROLL_FRAME_MS, self._animate_scroll)
 
     def _on_root_configure(self, event) -> None:
         if event.widget is self.root:
+            size = (int(event.width), int(event.height))
+            if size == self.last_root_size:
+                return
+            self.last_root_size = size
             self._schedule_responsive_layout()
 
     def _schedule_responsive_layout(self) -> None:
         if self.layout_after_id is not None:
             self.root.after_cancel(self.layout_after_id)
-        self.layout_after_id = self.root.after(60, self._apply_responsive_layout)
+        self.layout_after_id = self.root.after(LAYOUT_DEBOUNCE_MS, self._apply_responsive_layout)
+
+    def _mark_ui_interaction(self, duration: float = INTERACTION_COOLDOWN_SEC) -> None:
+        self.interaction_busy_until = max(self.interaction_busy_until, time.monotonic() + max(0.0, duration))
+
+    def _ui_interaction_active(self) -> bool:
+        return time.monotonic() < self.interaction_busy_until
+
+    def _responsive_flag(self, current: bool | None, width: int, breakpoint: int) -> bool:
+        if current is None:
+            return width < breakpoint
+        lower = breakpoint - LAYOUT_HYSTERESIS
+        upper = breakpoint + LAYOUT_HYSTERESIS
+        if current:
+            return width < upper
+        return width < lower
 
     def _apply_responsive_layout(self) -> None:
         self.layout_after_id = None
@@ -1416,38 +1640,89 @@ class EngagementApp:
             return
 
         content_width = max(1, self.content_frame.winfo_width() or self.root.winfo_width())
-        top_bar_compact = content_width < TOP_BAR_STACK_BREAKPOINT
-        main_stacked = content_width < MAIN_STACK_BREAKPOINT
+        main_stacked = self._responsive_flag(self.main_area_layout_stacked, content_width, MAIN_STACK_BREAKPOINT)
         tile_columns = max(1, min(len(self.signal_tile_order), content_width // TILE_MIN_WIDTH))
 
-        self._layout_top_bar(top_bar_compact)
+        self._layout_top_bar(False)
+        self._layout_top_bar_chips(3)
         self._layout_main_area(main_stacked)
-        self._layout_bottom_header(main_stacked)
+        self._layout_timer_cards(True)
+        self._layout_bottom_header(True)
         self._layout_signal_tiles(tile_columns)
         self._update_wraplengths(main_stacked)
 
     def _layout_top_bar(self, compact: bool) -> None:
+        if self.top_bar_layout_compact is not None:
+            self._layout_control_buttons(False)
+            return
+        self.top_bar_layout_compact = False
         self.title_frame.grid_forget()
         self.chip_frame.grid_forget()
         self.button_frame.grid_forget()
-
-        if compact:
-            self.top_bar.grid_columnconfigure(0, weight=1)
-            self.top_bar.grid_columnconfigure(1, weight=0)
-            self.top_bar.grid_columnconfigure(2, weight=0)
-            self.title_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 8))
-            self.chip_frame.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 8))
-            self.button_frame.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 18))
-            return
-
-        self.top_bar.grid_columnconfigure(0, weight=0)
-        self.top_bar.grid_columnconfigure(1, weight=1)
+        self.top_bar.grid_columnconfigure(0, weight=1)
+        self.top_bar.grid_columnconfigure(1, weight=0)
         self.top_bar.grid_columnconfigure(2, weight=0)
-        self.title_frame.grid(row=0, column=0, sticky="w", padx=20, pady=18)
-        self.chip_frame.grid(row=0, column=1, sticky="w", padx=(0, 20), pady=18)
-        self.button_frame.grid(row=0, column=2, sticky="e", padx=20, pady=18)
+        self.title_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 8))
+        self.chip_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 8))
+        self.button_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=20, pady=(0, 18))
+        self._layout_control_buttons(False)
+
+    def _layout_top_bar_chips(self, columns: int) -> None:
+        if not hasattr(self, "top_bar_chips") or not self.top_bar_chips:
+            return
+        columns = max(1, min(3, len(self.top_bar_chips)))
+        if self.top_chip_layout_columns is not None:
+            return
+        self.top_chip_layout_columns = columns
+
+        for index in range(len(self.top_bar_chips)):
+            self.chip_frame.grid_columnconfigure(index, weight=0, uniform="")
+            self.chip_frame.grid_rowconfigure(index, weight=0)
+
+        for chip in self.top_bar_chips:
+            chip.grid_forget()
+
+        for column in range(columns):
+            self.chip_frame.grid_columnconfigure(column, weight=1)
+
+        for index, chip in enumerate(self.top_bar_chips):
+            row = index // columns
+            column = index % columns
+            chip.grid(
+                row=row,
+                column=column,
+                sticky="ew",
+                padx=(0, 8 if column < columns - 1 else 0),
+                pady=(0 if row == 0 else 6, 0),
+            )
+
+    def _layout_control_buttons(self, compact: bool) -> None:
+        if self.control_buttons_compact is not None:
+            return
+        self.control_buttons_compact = False
+        buttons = [
+            self.start_button,
+            self.stop_button,
+            self.start_pomodoro_button,
+            self.stop_pomodoro_button,
+            self.start_mindfulness_button,
+            self.stop_mindfulness_button,
+        ]
+        for button in buttons:
+            button.grid_forget()
+
+        for index in range(6):
+            self.button_frame.grid_columnconfigure(index, weight=0, uniform="")
+        for column in range(3):
+            self.button_frame.grid_columnconfigure(column, weight=1, uniform="control_button")
+        positions = ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2))
+        for button, (row, column) in zip(buttons, positions):
+            button.grid(row=row, column=column, sticky="ew", padx=5, pady=5)
 
     def _layout_main_area(self, stacked: bool) -> None:
+        if self.main_area_layout_stacked == stacked:
+            return
+        self.main_area_layout_stacked = stacked
         self.preview_card.grid_forget()
         self.decision_card.grid_forget()
 
@@ -1467,23 +1742,34 @@ class EngagementApp:
         self.preview_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         self.decision_card.grid(row=0, column=1, sticky="nsew")
 
+    def _layout_timer_cards(self, stacked: bool) -> None:
+        if self.timer_row_layout_stacked is not None:
+            return
+        self.timer_row_layout_stacked = True
+        self.timer_cards_stacked = True
+        self.pomodoro_card.grid_forget()
+        self.mindfulness_card.grid_forget()
+        self.timer_row.grid_columnconfigure(0, weight=1, uniform="")
+        self.timer_row.grid_columnconfigure(1, weight=0, uniform="")
+        self.pomodoro_card.grid(row=0, column=0, sticky="ew")
+        self.mindfulness_card.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+
     def _layout_bottom_header(self, compact: bool) -> None:
+        if self.bottom_header_layout_compact is not None:
+            return
+        self.bottom_header_layout_compact = True
         self.bottom_title_label.grid_forget()
         self.bottom_meta_label.grid_forget()
-
-        if compact:
-            self.bottom_header.grid_columnconfigure(0, weight=1)
-            self.bottom_title_label.grid(row=0, column=0, sticky="w")
-            self.bottom_meta_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
-            return
-
         self.bottom_header.grid_columnconfigure(0, weight=1)
         self.bottom_title_label.grid(row=0, column=0, sticky="w")
-        self.bottom_meta_label.grid(row=0, column=1, sticky="e")
+        self.bottom_meta_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
     def _layout_signal_tiles(self, columns: int) -> None:
         if not self.signal_tile_order:
             return
+        if self.signal_tile_layout_columns == columns:
+            return
+        self.signal_tile_layout_columns = columns
 
         columns = max(1, min(columns, len(self.signal_tile_order)))
         for index in range(len(self.signal_tile_order)):
@@ -1504,7 +1790,8 @@ class EngagementApp:
         decision_width = max(360, self.decision_card.winfo_width())
         preview_width = max(360, self.preview_card.winfo_width())
         bottom_width = max(360, self.bottom_band.winfo_width())
-        tile_width = max(220, int((self.tiles_frame.winfo_width() or bottom_width) / max(1, len(self.signal_tile_order) or 1)))
+        tile_width = max(220, int((self.tiles_frame.winfo_width() or bottom_width) / max(1, self.signal_tile_layout_columns or len(self.signal_tile_order) or 1)))
+        timer_width = max(220, decision_width - 72 if self.timer_cards_stacked else int((decision_width - 96) / 2))
 
         headline_wrap = max(260, decision_width - 72)
         headline_size = 30 if decision_width >= 560 else 28 if decision_width >= 500 else 26 if decision_width >= 440 else 24
@@ -1515,16 +1802,47 @@ class EngagementApp:
         self.summary_label.configure(wraplength=max(240, decision_width - 72))
         self.spotlight_detail_label.configure(wraplength=max(240, decision_width - 72))
         self.spotlight_value.configure(font=("Bahnschrift SemiBold", 18 if decision_width >= 440 else 16))
-        self.pomodoro_note_label.configure(wraplength=max(240, decision_width - 72))
+        self.pomodoro_next_label.configure(wraplength=max(220, timer_width - 36))
+        self.pomodoro_note_label.configure(wraplength=max(180, timer_width - 36))
+        self.mindfulness_next_label.configure(wraplength=max(220, timer_width - 36))
+        self.mindfulness_note_label.configure(wraplength=max(180, timer_width - 36))
         self.preview_footer.configure(wraplength=max(260, preview_width - 40))
         self.bottom_meta_label.configure(wraplength=max(240, bottom_width - 40))
         self.engagement_summary_note_label.configure(wraplength=max(260, bottom_width - 40))
+        self.learning_suggestion_label.configure(wraplength=max(260, bottom_width - 40))
         self.feedback_info_label.configure(wraplength=max(260, bottom_width - 40))
         self.feedback_status_label.configure(wraplength=max(260, bottom_width - 40))
         for tile in self.signal_tiles.values():
             tile["detail"].configure(wraplength=max(180, tile_width - 36))
-        self.preview_stage.configure(height=PREVIEW_STAGE_COMPACT_HEIGHT if main_stacked else PREVIEW_STAGE_HEIGHT)
-        self._on_preview_configure(None)
+        target_height = PREVIEW_STAGE_COMPACT_HEIGHT if main_stacked else PREVIEW_STAGE_HEIGHT
+        if int(self.preview_stage.cget("height")) != target_height:
+            self.preview_stage.configure(height=target_height)
+
+    def _preview_stage_target_height(self, main_stacked: bool) -> int:
+        return PREVIEW_STAGE_COMPACT_HEIGHT if main_stacked else PREVIEW_STAGE_HEIGHT
+
+    def _current_preview_size(self) -> tuple[int, int]:
+        stage_width = max(320, self.preview_stage.winfo_width() if hasattr(self, "preview_stage") else 0)
+        stage_height = max(240, self.preview_stage.winfo_height() if hasattr(self, "preview_stage") else 0)
+        return int(stage_width), int(stage_height)
+
+    def _schedule_preview_refresh(self, delay_ms: int | None = None) -> None:
+        if self.closing or not hasattr(self, "preview_stage"):
+            return
+        if self.preview_refresh_after_id is not None:
+            return
+        wait_ms = PREVIEW_REFRESH_DEBOUNCE_MS if delay_ms is None else max(0, int(delay_ms))
+        self.preview_refresh_after_id = self.root.after(wait_ms, self._refresh_preview_after_resize)
+
+    def _refresh_preview_after_resize(self) -> None:
+        self.preview_refresh_after_id = None
+        requested_size = self.preview_requested_size or self._current_preview_size()
+        self.preview_requested_size = requested_size
+        if self.last_frame is None:
+            self.preview_last_size = requested_size
+            self._draw_preview_placeholder()
+            return
+        self._update_preview(self.last_frame, force=True)
 
     def _create_card(self, parent: tk.Misc, bg: str | None = None, border: str | None = None) -> tk.Frame:
         return tk.Frame(
@@ -1541,16 +1859,22 @@ class EngagementApp:
             text=text,
             bg=bg,
             fg=fg or COLORS["text"],
-            padx=12,
+            padx=10,
             pady=6,
             font=("Segoe UI Semibold", 9),
         )
+
+    def _invoke_button_command(self, command) -> None:
+        self._mark_ui_interaction()
+        if self.closing:
+            return
+        self.root.after_idle(command)
 
     def _create_button(self, parent: tk.Misc, text: str, command, bg: str, fg: str = COLORS["text"]) -> tk.Button:
         return tk.Button(
             parent,
             text=text,
-            command=command,
+            command=lambda cmd=command: self._invoke_button_command(cmd),
             bg=bg,
             fg=fg,
             activebackground=mix_color(bg, "#ffffff", 0.12),
@@ -1586,6 +1910,7 @@ class EngagementApp:
     def _create_stat_block(self, parent: tk.Misc, title: str) -> dict[str, Any]:
         frame = self._create_card(parent, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
         frame.configure(height=STAT_BLOCK_HEIGHT)
+        frame.grid_propagate(False)
         frame.pack_propagate(False)
         title_label = tk.Label(frame, text=title, bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 9))
         value_label = tk.Label(frame, text="50%", bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 18))
@@ -1596,6 +1921,8 @@ class EngagementApp:
             fg=COLORS["text_muted"],
             justify="left",
             anchor="w",
+            height=2,
+            wraplength=220,
             font=("Segoe UI", 9),
         )
         title_label.pack(anchor="w", padx=14, pady=(10, 2))
@@ -1624,13 +1951,20 @@ class EngagementApp:
         ).pack(anchor="w", pady=(4, 0))
 
         self.chip_frame = tk.Frame(self.top_bar, bg=COLORS["panel"])
-        self.chip_frame.grid(row=0, column=1, sticky="w", padx=(0, 20), pady=18)
+        self.chip_frame.grid(row=0, column=1, sticky="ew", padx=(0, 20), pady=18)
         self.status_chip = self._create_chip(self.chip_frame, self.status_var.get(), COLORS["panel_soft"])
-        self.status_chip.pack(side="left", padx=(0, 8))
-        self._create_chip(self.chip_frame, self.device_label, COLORS["panel_alt"]).pack(side="left", padx=(0, 8))
-        self._create_chip(self.chip_frame, self.model_variant.title(), COLORS["panel_alt"]).pack(side="left", padx=(0, 8))
-        self._create_chip(self.chip_frame, f"{self.head_count} head{'s' if self.head_count != 1 else ''}", COLORS["panel_alt"]).pack(side="left", padx=(0, 8))
-        self._create_chip(self.chip_frame, f"Seq {self.seq_len}", COLORS["panel_alt"]).pack(side="left")
+        self.device_chip = self._create_chip(self.chip_frame, self.device_label, COLORS["panel_alt"])
+        self.variant_chip = self._create_chip(self.chip_frame, self.model_variant.title(), COLORS["panel_alt"])
+        self.head_count_chip = self._create_chip(self.chip_frame, f"{self.head_count} Head{'s' if self.head_count != 1 else ''}", COLORS["panel_alt"])
+        self.sequence_chip = self._create_chip(self.chip_frame, f"Seq {self.seq_len}", COLORS["panel_alt"])
+        self.top_bar_chips = [
+            self.status_chip,
+            self.device_chip,
+            self.variant_chip,
+            self.head_count_chip,
+            self.sequence_chip,
+        ]
+        self._layout_top_bar_chips(3)
 
         self.button_frame = tk.Frame(self.top_bar, bg=COLORS["panel"])
         self.button_frame.grid(row=0, column=2, sticky="e", padx=20, pady=18)
@@ -1638,13 +1972,13 @@ class EngagementApp:
         self.stop_button = self._create_button(self.button_frame, "Stop Camera", self.stop, COLORS["panel_alt"])
         self.start_pomodoro_button = self._create_button(self.button_frame, "Start Pomodoro", self.start_pomodoro, COLORS["blue_soft"], fg=COLORS["blue"])
         self.stop_pomodoro_button = self._create_button(self.button_frame, "Stop Pomodoro", self.stop_pomodoro, COLORS["panel_alt"])
-        self.start_button.pack(side="left", padx=(0, 10))
-        self.stop_button.pack(side="left")
-        self.start_pomodoro_button.pack(side="left", padx=(10, 0))
-        self.stop_pomodoro_button.pack(side="left", padx=(10, 0))
+        self.start_mindfulness_button = self._create_button(self.button_frame, "Start Mindfulness", self.start_mindfulness, COLORS["green_soft"], fg=COLORS["green"])
+        self.stop_mindfulness_button = self._create_button(self.button_frame, "Stop Mindfulness", self.stop_mindfulness, COLORS["panel_alt"])
+        self._layout_control_buttons(compact=False)
         self.stop_button.configure(state="disabled")
         self.start_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
         self.stop_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
+        self.stop_mindfulness_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
 
         self.main_area = tk.Frame(self.content_frame, bg=COLORS["bg"])
         self.main_area.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
@@ -1688,6 +2022,7 @@ class EngagementApp:
             bg=COLORS["panel"],
             fg=COLORS["text_muted"],
             anchor="w",
+            height=2,
             justify="left",
             font=("Segoe UI", 10),
         )
@@ -1734,6 +2069,7 @@ class EngagementApp:
             fg=COLORS["text_soft"],
             justify="left",
             anchor="w",
+            height=2,
             wraplength=460,
             font=("Segoe UI Semibold", 13),
         )
@@ -1743,6 +2079,7 @@ class EngagementApp:
             textvariable=self.summary_var,
             bg=COLORS["panel_alt"],
             fg=COLORS["text_soft"],
+            height=3,
             wraplength=460,
             justify="left",
             anchor="nw",
@@ -1755,8 +2092,6 @@ class EngagementApp:
 
         self.stat_row = tk.Frame(self.decision_body, bg=COLORS["panel"])
         self.stat_row.grid(row=1, column=0, sticky="ew", pady=(18, 0))
-        self.stat_row.configure(height=STAT_BLOCK_HEIGHT)
-        self.stat_row.grid_propagate(False)
         self.stat_row.grid_columnconfigure(0, weight=1)
         self.stat_row.grid_columnconfigure(1, weight=1)
         self.engaged_block = self._create_stat_block(self.stat_row, "Engaged")
@@ -1776,6 +2111,7 @@ class EngagementApp:
             textvariable=self.spotlight_detail_var,
             bg=COLORS["panel_alt"],
             fg=COLORS["text_soft"],
+            height=2,
             wraplength=470,
             justify="left",
             font=("Segoe UI", 10),
@@ -1783,11 +2119,15 @@ class EngagementApp:
         self.spotlight_detail_label.pack(anchor="w", padx=16, pady=(4, 8))
         self.spotlight_meter = tk.Canvas(self.spotlight_card, height=16, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
         self.spotlight_meter.pack(fill="x", padx=16, pady=(0, 6))
-        self.spotlight_band = tk.Canvas(self.spotlight_card, height=36, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+        self.spotlight_band = tk.Canvas(self.spotlight_card, height=42, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
         self.spotlight_band.pack(fill="x", padx=16, pady=(0, 12))
 
-        self.pomodoro_card = self._create_card(self.decision_body, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
-        self.pomodoro_card.grid(row=3, column=0, sticky="ew", pady=(18, 0))
+        self.timer_row = tk.Frame(self.decision_body, bg=COLORS["panel"])
+        self.timer_row.grid(row=3, column=0, sticky="ew", pady=(18, 0))
+        self.timer_row.grid_columnconfigure(0, weight=1)
+        self.timer_row.grid_columnconfigure(1, weight=1)
+
+        self.pomodoro_card = self._create_card(self.timer_row, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
         self.pomodoro_card.configure(height=POMODORO_CARD_HEIGHT)
         self.pomodoro_card.grid_propagate(False)
         self.pomodoro_card.grid_columnconfigure(0, weight=1)
@@ -1801,7 +2141,18 @@ class EngagementApp:
 
         tk.Label(self.pomodoro_card, textvariable=self.pomodoro_time_var, bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 28)).grid(row=1, column=0, sticky="w", padx=16)
         tk.Label(self.pomodoro_card, textvariable=self.pomodoro_block_var, bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 11)).grid(row=2, column=0, sticky="w", padx=16, pady=(2, 2))
-        tk.Label(self.pomodoro_card, textvariable=self.pomodoro_next_var, bg=COLORS["panel_alt"], fg=COLORS["text_muted"], font=("Segoe UI", 10)).grid(row=3, column=0, sticky="w", padx=16)
+        self.pomodoro_next_label = tk.Label(
+            self.pomodoro_card,
+            textvariable=self.pomodoro_next_var,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text_muted"],
+            justify="left",
+            anchor="w",
+            height=2,
+            wraplength=470,
+            font=("Segoe UI", 10),
+        )
+        self.pomodoro_next_label.grid(row=3, column=0, sticky="ew", padx=16)
         self.pomodoro_note_label = tk.Label(
             self.pomodoro_card,
             textvariable=self.pomodoro_note_var,
@@ -1809,12 +2160,55 @@ class EngagementApp:
             fg=COLORS["text_soft"],
             justify="left",
             anchor="w",
+            height=3,
             wraplength=470,
             font=("Segoe UI", 9),
         )
         self.pomodoro_note_label.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 8))
         self.pomodoro_progress_canvas = tk.Canvas(self.pomodoro_card, height=22, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
         self.pomodoro_progress_canvas.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 14))
+
+        self.mindfulness_card = self._create_card(self.timer_row, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+        self.mindfulness_card.configure(height=MINDFULNESS_CARD_HEIGHT)
+        self.mindfulness_card.grid_propagate(False)
+        self.mindfulness_card.grid_columnconfigure(0, weight=1)
+
+        mindfulness_header = tk.Frame(self.mindfulness_card, bg=COLORS["panel_alt"])
+        mindfulness_header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 10))
+        mindfulness_header.grid_columnconfigure(0, weight=1)
+        tk.Label(mindfulness_header, text="MINDFULNESS TIMER", bg=COLORS["panel_alt"], fg=COLORS["text_muted"], font=("Segoe UI Semibold", 9)).grid(row=0, column=0, sticky="w")
+        self.mindfulness_chip = self._create_chip(mindfulness_header, "Idle", COLORS["panel_soft"], fg=COLORS["text_soft"])
+        self.mindfulness_chip.grid(row=0, column=1, sticky="e")
+
+        tk.Label(self.mindfulness_card, textvariable=self.mindfulness_time_var, bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 28)).grid(row=1, column=0, sticky="w", padx=16)
+        tk.Label(self.mindfulness_card, textvariable=self.mindfulness_block_var, bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 11)).grid(row=2, column=0, sticky="w", padx=16, pady=(2, 2))
+        self.mindfulness_next_label = tk.Label(
+            self.mindfulness_card,
+            textvariable=self.mindfulness_next_var,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text_muted"],
+            justify="left",
+            anchor="w",
+            height=2,
+            wraplength=470,
+            font=("Segoe UI", 10),
+        )
+        self.mindfulness_next_label.grid(row=3, column=0, sticky="ew", padx=16)
+        self.mindfulness_note_label = tk.Label(
+            self.mindfulness_card,
+            textvariable=self.mindfulness_note_var,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text_soft"],
+            justify="left",
+            anchor="w",
+            height=3,
+            wraplength=470,
+            font=("Segoe UI", 9),
+        )
+        self.mindfulness_note_label.grid(row=4, column=0, sticky="ew", padx=16, pady=(8, 8))
+        self.mindfulness_progress_canvas = tk.Canvas(self.mindfulness_card, height=22, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+        self.mindfulness_progress_canvas.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 14))
+        self._layout_timer_cards(stacked=False)
 
         self.bottom_band = self._create_card(self.content_frame, bg=COLORS["panel"], border=COLORS["border"])
         self.bottom_band.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 18))
@@ -1846,10 +2240,23 @@ class EngagementApp:
             bg=COLORS["panel"],
             fg=COLORS["text_soft"],
             anchor="w",
+            height=2,
             justify="left",
             font=("Segoe UI", 9),
         )
         self.engagement_summary_note_label.grid(row=2, column=0, sticky="ew", padx=20, pady=(10, 0))
+
+        self.learning_suggestion_label = tk.Label(
+            self.bottom_band,
+            textvariable=self.learning_suggestion_var,
+            bg=COLORS["panel"],
+            fg=COLORS["green"],
+            anchor="w",
+            height=2,
+            justify="left",
+            font=("Segoe UI Semibold", 9),
+        )
+        self.learning_suggestion_label.grid(row=3, column=0, sticky="ew", padx=20, pady=(8, 0))
 
         self.feedback_info_label = tk.Label(
             self.bottom_band,
@@ -1857,10 +2264,11 @@ class EngagementApp:
             bg=COLORS["panel"],
             fg=COLORS["text_soft"],
             anchor="w",
+            height=3,
             justify="left",
             font=("Segoe UI", 9),
         )
-        self.feedback_info_label.grid(row=3, column=0, sticky="ew", padx=20, pady=(10, 0))
+        self.feedback_info_label.grid(row=4, column=0, sticky="ew", padx=20, pady=(10, 0))
 
         self.feedback_status_label = tk.Label(
             self.bottom_band,
@@ -1868,13 +2276,14 @@ class EngagementApp:
             bg=COLORS["panel"],
             fg=COLORS["text_muted"],
             anchor="w",
+            height=1,
             justify="left",
             font=("Segoe UI", 9),
         )
-        self.feedback_status_label.grid(row=4, column=0, sticky="ew", padx=20, pady=(4, 10))
+        self.feedback_status_label.grid(row=5, column=0, sticky="ew", padx=20, pady=(4, 10))
 
         self.tiles_frame = tk.Frame(self.bottom_band, bg=COLORS["panel"])
-        self.tiles_frame.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 14))
+        self.tiles_frame.grid(row=6, column=0, sticky="ew", padx=14, pady=(0, 14))
         self._build_signal_tiles()
 
     def _build_signal_tiles(self) -> None:
@@ -1895,6 +2304,8 @@ class EngagementApp:
 
         for spec in tile_specs:
             tile = self._create_card(self.tiles_frame, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+            tile.configure(height=SIGNAL_TILE_HEIGHT)
+            tile.pack_propagate(False)
             tk.Label(tile, text=spec["label"], bg=COLORS["panel_alt"], fg=COLORS["text_soft"], font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=14, pady=(14, 4))
             value = tk.Label(tile, text="50%", bg=COLORS["panel_alt"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 24))
             value.pack(anchor="w", padx=14)
@@ -1905,13 +2316,14 @@ class EngagementApp:
                 fg=COLORS["text_muted"],
                 justify="left",
                 anchor="w",
+                height=2,
                 wraplength=220,
                 font=("Segoe UI", 9),
             )
             detail.pack(anchor="w", padx=14, pady=(2, 10))
             meter = tk.Canvas(tile, height=16, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
             meter.pack(fill="x", padx=14, pady=(0, 6))
-            band = tk.Canvas(tile, height=34, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
+            band = tk.Canvas(tile, height=40, bg=COLORS["panel_alt"], highlightthickness=0, bd=0)
             band.pack(fill="x", padx=14, pady=(0, 14))
             self.signal_tile_order.append(spec["key"])
             self.signal_tiles[spec["key"]] = {
@@ -1954,9 +2366,9 @@ class EngagementApp:
     ) -> None:
         canvas.delete("all")
         width = max(120, canvas.winfo_width() or 240)
-        height = max(28, canvas.winfo_height() or 34)
-        label_y = 7
-        band_top = 15
+        height = max(40, canvas.winfo_height() or 40)
+        label_y = 4
+        band_top = 20
         band_bottom = max(band_top + 8, height - 10)
         segment_width = width / len(DISPLAY_AFFECT_LEVELS)
         muted_label = COLORS["text_muted"]
@@ -1975,6 +2387,7 @@ class EngagementApp:
                 text=label,
                 fill=accent if index == active_index else muted_label,
                 font=("Segoe UI Semibold", 8),
+                anchor="n",
             )
 
         canvas.create_rectangle(0, band_top, width, band_bottom, outline=COLORS["border_soft"], width=1)
@@ -1982,7 +2395,7 @@ class EngagementApp:
             return
 
         marker_x = max(4.0, min(width - 4.0, float(display_state["marker_position"]) * width))
-        canvas.create_line(marker_x, band_top - 2, marker_x, band_bottom + 6, fill=accent, width=2)
+        canvas.create_line(marker_x, band_top - 2, marker_x, band_bottom + 5, fill=accent, width=2)
         canvas.create_oval(
             marker_x - 4,
             band_bottom + 1,
@@ -2125,6 +2538,7 @@ class EngagementApp:
         summary: str,
         footer: str,
         preview_badge: str | None = None,
+        profile: AffectProfile | None = None,
     ) -> None:
         self.state = state
         self.status_var.set(STATE_STYLES[state]["badge"])
@@ -2134,6 +2548,12 @@ class EngagementApp:
         self.summary_var.set(summary)
         self.footer_var.set(footer)
         self._apply_state_palette(state)
+        self.latest_affect_profile = self._fallback_affect_profile(state) if profile is None else profile
+        self._refresh_learning_suggestion(self.latest_affect_profile)
+        if hasattr(self, "pomodoro_note_var"):
+            self._refresh_pomodoro_ui()
+        if hasattr(self, "mindfulness_note_var"):
+            self._refresh_mindfulness_ui()
 
     def _binary_detail(self, display_state: dict[str, Any]) -> str:
         return f"Lead level: {display_state['label']}"
@@ -2277,6 +2697,7 @@ class EngagementApp:
 
         state = self._stable_choice(self.primary_transition, raw_state, STATE_SWITCH_PATIENCE)
         headline, summary = self._primary_copy(state, active_signal)
+        profile = self._affect_profile_from_display_states(state, display_states)
 
         confidence = (
             f"{primary_confidence * 100:.0f}% window confidence, "
@@ -2284,7 +2705,7 @@ class EngagementApp:
             f"Dominant level {engagement_display_state['label']}"
         )
         footer = "Live monitoring active. Secondary tiles refresh from the current frame window."
-        self._set_state(state, headline, confidence, summary, footer, preview_badge="Live")
+        self._set_state(state, headline, confidence, summary, footer, preview_badge="Live", profile=profile)
         self._update_spotlight(active_signal, spotlight_threshold)
         self._update_signal_tiles(output, active_signal, display_states, spotlight_threshold)
 
@@ -2296,9 +2717,12 @@ class EngagementApp:
         )
         self.preview_photo = None
 
-    def _update_preview(self, frame: np.ndarray | None) -> None:
+    def _update_preview(self, frame: np.ndarray | None, *, force: bool = False) -> None:
         if frame is None:
             self._draw_preview_placeholder()
+            return
+        now = time.monotonic()
+        if not force and (now - self.last_preview_update_monotonic) < PREVIEW_UPDATE_INTERVAL_SEC:
             return
 
         display_frame = cv2.flip(frame, 1) if MIRROR_PREVIEW else frame
@@ -2306,7 +2730,7 @@ class EngagementApp:
         height = max(240, self.preview_label.winfo_height())
         rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
-        image.thumbnail((width, height), Image.Resampling.LANCZOS)
+        image.thumbnail((width, height), Image.Resampling.BILINEAR)
         canvas = Image.new("RGB", (width, height), COLORS["preview"])
         x_pos = (width - image.width) // 2
         y_pos = (height - image.height) // 2
@@ -2314,12 +2738,23 @@ class EngagementApp:
         photo = ImageTk.PhotoImage(canvas)
         self.preview_photo = photo
         self.preview_label.configure(image=photo, text="")
+        self.last_preview_update_monotonic = now
+        self.preview_last_size = (width, height)
 
     def _on_preview_configure(self, _event) -> None:
+        size = self._current_preview_size()
+        self.preview_requested_size = size
         if self.last_frame is None:
             self._draw_preview_placeholder()
-        else:
-            self._update_preview(self.last_frame)
+            self.preview_last_size = size
+            return
+        width_delta = abs(size[0] - self.preview_last_size[0])
+        height_delta = abs(size[1] - self.preview_last_size[1])
+        if width_delta < PREVIEW_RESIZE_EPSILON and height_delta < PREVIEW_RESIZE_EPSILON:
+            return
+        elapsed = time.monotonic() - self.last_preview_update_monotonic
+        remaining_ms = max(0, int((PREVIEW_RENDER_INTERVAL_SEC - elapsed) * 1000))
+        self._schedule_preview_refresh(delay_ms=remaining_ms)
 
     def start(self) -> None:
         if self.running:
@@ -2334,6 +2769,8 @@ class EngagementApp:
         self.session_token += 1
         self.frame_buffer.clear()
         self.last_frame = None
+        self.last_preview_update_monotonic = 0.0
+        self.last_warming_status_buffered = -1
         self.frame_counter = 0
         self.capture_failures = 0
         self.display_output = self._neutral_output()
@@ -2369,18 +2806,19 @@ class EngagementApp:
         if self.pomodoro_active or self.checkin_dialog is not None or self.pomodoro_prompt_pending:
             self._close_checkin_dialog()
             self._reset_pomodoro_state(phase="stopped", reason="Pomodoro halted because live monitoring stopped.")
+        if self.mindfulness_active:
+            self._reset_mindfulness_state(phase="stopped", reason="Mindfulness stopped because live monitoring stopped.")
         self.running = False
         self.session_token += 1
         if self.capture_after_id:
             self.root.after_cancel(self.capture_after_id)
             self.capture_after_id = None
-        if self.ui_after_id:
-            self.root.after_cancel(self.ui_after_id)
-            self.ui_after_id = None
         if self.capture is not None:
             self.capture.release()
             self.capture = None
         self.frame_buffer.clear()
+        self.last_preview_update_monotonic = 0.0
+        self.last_warming_status_buffered = -1
         self.frame_counter = 0
         self.capture_failures = 0
         self.last_output_time = 0.0
@@ -2420,8 +2858,8 @@ class EngagementApp:
             self.capture_after_id = self.root.after(delay_ms, self._capture_loop)
 
     def _schedule_ui(self) -> None:
-        if not self.closing:
-            self.ui_after_id = self.root.after(50, self._update_loop)
+        if not self.closing and self.ui_after_id is None:
+            self.ui_after_id = self.root.after(UI_UPDATE_INTERVAL_MS, self._update_loop)
 
     def _try_reopen_camera(self) -> bool:
         if self.capture is not None:
@@ -2512,14 +2950,24 @@ class EngagementApp:
 
         buffered = len(self.frame_buffer)
         if buffered < self.seq_len:
-            self._set_state(
-                "warming_up",
-                "Warming Up",
-                "Collecting live frame context",
-                f"Buffering {self.seq_len} frames before the first decision.",
-                f"Frame buffer {buffered}/{self.seq_len}",
-                preview_badge="Warming",
+            should_refresh_warming = (
+                buffered != self.last_warming_status_buffered
+                and (
+                    buffered <= 1
+                    or buffered >= (self.seq_len - 1)
+                    or (buffered % WARMING_STATUS_STEP) == 0
+                )
             )
+            if should_refresh_warming:
+                self.last_warming_status_buffered = buffered
+                self._set_state(
+                    "warming_up",
+                    "Warming Up",
+                    "Collecting live frame context",
+                    f"Buffering {self.seq_len} frames before the first decision.",
+                    f"Frame buffer {buffered}/{self.seq_len}",
+                    preview_badge="Warming",
+                )
         elif time.time() - self.last_prediction_time >= INFERENCE_INTERVAL_SEC:
             frames_for_inference: list[np.ndarray] | None = None
             inference_id: tuple[int, int] | None = None
@@ -2536,11 +2984,19 @@ class EngagementApp:
         self._schedule_capture()
 
     def _update_loop(self) -> None:
+        self.ui_after_id = None
+        if self.closing:
+            return
+
         if not self.running:
+            self._update_pomodoro_timer()
+            self._update_mindfulness_timer()
+            self._schedule_ui()
             return
 
         pending_output: dict[str, Any] | None = None
         pending_error = None
+        output_updated = False
         with self.output_lock:
             if self.pending_output is not None:
                 pending_output = dict(self.pending_output)
@@ -2552,6 +3008,7 @@ class EngagementApp:
         if pending_error:
             self.stop()
             self._set_error_view(pending_error)
+            self._schedule_ui()
             return
 
         if pending_output is not None:
@@ -2561,15 +3018,17 @@ class EngagementApp:
                 self.output_history.append(output)
                 stacked = np.stack(list(self.output_history), axis=0)
                 self.target_output = stacked.mean(axis=0).astype(np.float32)
+                output_updated = True
                 self.last_output_time = time.time()
                 self._record_engagement_sample(self.target_output, self.last_output_time)
                 self._record_pomodoro_output_sample(self.target_output, self.last_output_time)
 
-        if self.target_output is not None and len(self.frame_buffer) >= self.seq_len:
+        if output_updated and self.target_output is not None and len(self.frame_buffer) >= self.seq_len and not self._ui_interaction_active():
             self.display_output = ((1.0 - DISPLAY_BLEND) * self.display_output + DISPLAY_BLEND * self.target_output).astype(np.float32)
             self._update_primary_view(self.display_output)
 
         self._update_pomodoro_timer()
+        self._update_mindfulness_timer()
         self._schedule_ui()
 
     def on_close(self) -> None:
@@ -2578,6 +3037,12 @@ class EngagementApp:
             self.root.after_cancel(self.scroll_animation_after_id)
             self.scroll_animation_after_id = None
         self.scroll_pending_pixels = 0.0
+        if self.preview_refresh_after_id is not None:
+            self.root.after_cancel(self.preview_refresh_after_id)
+            self.preview_refresh_after_id = None
+        if self.ui_after_id is not None:
+            self.root.after_cancel(self.ui_after_id)
+            self.ui_after_id = None
         self._close_checkin_dialog()
         self.stop()
         self.root.destroy()
