@@ -67,7 +67,7 @@ SCROLL_EASING = 0.32
 SCROLL_FRAME_MS = 8
 SCROLL_MIN_STEP_PIXELS = 0.5
 LAYOUT_DEBOUNCE_MS = 60
-PREVIEW_REFRESH_DEBOUNCE_MS = 16
+PREVIEW_REFRESH_DEBOUNCE_MS = 110
 PREVIEW_RESIZE_EPSILON = 6
 LAYOUT_HYSTERESIS = 48
 PREVIEW_RENDER_INTERVAL_SEC = 1.0 / 24.0
@@ -462,6 +462,7 @@ class EngagementApp:
         self.preview_refresh_after_id: str | None = None
         self.preview_last_size = (0, 0)
         self.preview_requested_size = (0, 0)
+        self.preview_resize_busy_until = 0.0
         self.last_preview_render_at = 0.0
         self.last_panel_render_at = 0.0
         self.interaction_busy_until = 0.0
@@ -1830,19 +1831,21 @@ class EngagementApp:
         if self.closing or not hasattr(self, "preview_stage"):
             return
         if self.preview_refresh_after_id is not None:
-            return
+            self.root.after_cancel(self.preview_refresh_after_id)
         wait_ms = PREVIEW_REFRESH_DEBOUNCE_MS if delay_ms is None else max(0, int(delay_ms))
         self.preview_refresh_after_id = self.root.after(wait_ms, self._refresh_preview_after_resize)
 
     def _refresh_preview_after_resize(self) -> None:
         self.preview_refresh_after_id = None
+        self.preview_resize_busy_until = 0.0
         requested_size = self.preview_requested_size or self._current_preview_size()
         self.preview_requested_size = requested_size
         if self.last_frame is None:
             self.preview_last_size = requested_size
             self._draw_preview_placeholder()
             return
-        self._update_preview(self.last_frame, force=True)
+        self.preview_last_size = requested_size
+        self.last_preview_update_monotonic = 0.0
 
     def _create_card(self, parent: tk.Misc, bg: str | None = None, border: str | None = None) -> tk.Frame:
         return tk.Frame(
@@ -2726,8 +2729,11 @@ class EngagementApp:
             return
 
         display_frame = cv2.flip(frame, 1) if MIRROR_PREVIEW else frame
-        width = max(320, self.preview_label.winfo_width())
-        height = max(240, self.preview_label.winfo_height())
+        if not force and now < self.preview_resize_busy_until and all(self.preview_requested_size):
+            width, height = self.preview_requested_size
+        else:
+            width = max(320, self.preview_label.winfo_width())
+            height = max(240, self.preview_label.winfo_height())
         rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
         image.thumbnail((width, height), Image.Resampling.BILINEAR)
@@ -2752,9 +2758,8 @@ class EngagementApp:
         height_delta = abs(size[1] - self.preview_last_size[1])
         if width_delta < PREVIEW_RESIZE_EPSILON and height_delta < PREVIEW_RESIZE_EPSILON:
             return
-        elapsed = time.monotonic() - self.last_preview_update_monotonic
-        remaining_ms = max(0, int((PREVIEW_RENDER_INTERVAL_SEC - elapsed) * 1000))
-        self._schedule_preview_refresh(delay_ms=remaining_ms)
+        self.preview_resize_busy_until = time.monotonic() + (PREVIEW_REFRESH_DEBOUNCE_MS / 1000.0)
+        self._schedule_preview_refresh()
 
     def start(self) -> None:
         if self.running:
@@ -2771,6 +2776,7 @@ class EngagementApp:
         self.last_frame = None
         self.last_preview_update_monotonic = 0.0
         self.last_warming_status_buffered = -1
+        self.preview_resize_busy_until = 0.0
         self.frame_counter = 0
         self.capture_failures = 0
         self.display_output = self._neutral_output()
@@ -2819,6 +2825,7 @@ class EngagementApp:
         self.frame_buffer.clear()
         self.last_preview_update_monotonic = 0.0
         self.last_warming_status_buffered = -1
+        self.preview_resize_busy_until = 0.0
         self.frame_counter = 0
         self.capture_failures = 0
         self.last_output_time = 0.0
