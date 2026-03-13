@@ -988,6 +988,17 @@ def pomodoro_timer_view(
             current_progress=1.0,
         )
 
+    if phase == "reflect":
+        return PomodoroTimerView(
+            status="Reflection",
+            time_text=format_clock(0),
+            block_text="Session complete",
+            next_text="One final reflection before closing this Pomodoro",
+            note_text=status_reason or "The 24-minute Pomodoro just ended. Add one quick overall reflection or skip it.",
+            completed_blocks=3,
+            current_progress=1.0,
+        )
+
     if phase == "complete":
         return PomodoroTimerView(
             status="Complete",
@@ -1073,6 +1084,16 @@ def mindfulness_timer_view(
             ),
             note_text="How do you feel right now? Your answer selects the next practice for the next 1.8 minutes.",
             progress=progress,
+        )
+
+    if phase == "reflect":
+        return MindfulnessTimerView(
+            status="Reflection",
+            time_text=format_clock(0),
+            block_text="Reset complete",
+            next_text="One final reflection before closing this reset",
+            note_text=status_reason or "The 8-minute mindfulness reset just ended. Add one quick overall reflection or skip it.",
+            progress=1.0,
         )
 
     if phase == "complete":

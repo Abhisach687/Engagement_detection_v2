@@ -108,6 +108,30 @@ POMODORO_TOTAL_MINUTES = 24
 MINDFULNESS_TOTAL_MINUTES = 8
 POMODORO_FRAME_SAMPLE_INTERVAL_SEC = 4.0
 POMODORO_FEEDBACK_SOURCE = "pomodoro_checkin"
+POMODORO_FINAL_FEEDBACK_SOURCE = "pomodoro_final_experience"
+MINDFULNESS_FINAL_FEEDBACK_SOURCE = "mindfulness_final_experience"
+
+FINAL_EXPERIENCE_RATING_OPTIONS = (
+    ("1", "Not helpful"),
+    ("2", "Slightly helpful"),
+    ("3", "Mixed"),
+    ("4", "Helpful"),
+    ("5", "Very helpful"),
+)
+MINDFULNESS_FINAL_OUTCOME_TAGS = (
+    "Calmer",
+    "Clearer",
+    "More grounded",
+    "Still unsettled",
+    "No clear shift",
+)
+POMODORO_FINAL_OUTCOME_TAGS = (
+    "More focused",
+    "Clearer next step",
+    "Less stuck",
+    "Still stuck",
+    "No clear shift",
+)
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -425,6 +449,8 @@ class EngagementApp:
         self.session_token = 0
         self.checkin_dialog: tk.Toplevel | None = None
         self.mindfulness_checkin_dialog: tk.Toplevel | None = None
+        self.pomodoro_final_dialog: tk.Toplevel | None = None
+        self.mindfulness_final_dialog: tk.Toplevel | None = None
         self.frame_counter = 0
         self.capture_failures = 0
 
@@ -482,6 +508,7 @@ class EngagementApp:
         self.pomodoro_active = False
         self.pomodoro_paused = False
         self.pomodoro_prompt_pending = False
+        self.pomodoro_final_prompt_pending = False
         self.pomodoro_completed_blocks = 0
         self.pomodoro_current_block_index = 0
         self.pomodoro_remaining_seconds = float(POMODORO_TOTAL_SECONDS)
@@ -505,9 +532,11 @@ class EngagementApp:
         self.mindfulness_active = False
         self.mindfulness_paused = False
         self.mindfulness_prompt_pending = False
+        self.mindfulness_final_prompt_pending = False
         self.mindfulness_remaining_seconds = float(MINDFULNESS_TOTAL_SECONDS)
         self.mindfulness_elapsed_seconds = 0.0
         self.mindfulness_last_tick_monotonic: float | None = None
+        self.mindfulness_session_start_epoch: float | None = None
         self.mindfulness_phase = "idle"
         self.mindfulness_status_reason = ""
         self.mindfulness_checkin_boundaries = mindfulness_checkin_boundaries()
@@ -867,9 +896,11 @@ class EngagementApp:
         self.pomodoro_last_frame_sample_at = 0.0
 
     def _reset_pomodoro_state(self, *, phase: str | None = None, reason: str = "") -> None:
+        self._close_pomodoro_final_dialog()
         self.pomodoro_active = False
         self.pomodoro_paused = False
         self.pomodoro_prompt_pending = False
+        self.pomodoro_final_prompt_pending = False
         self.pomodoro_completed_blocks = 0
         self.pomodoro_current_block_index = 0
         self.pomodoro_remaining_seconds = float(POMODORO_TOTAL_SECONDS)
@@ -948,12 +979,15 @@ class EngagementApp:
 
     def _reset_mindfulness_state(self, *, phase: str = "idle", reason: str = "") -> None:
         self._close_mindfulness_checkin_dialog()
+        self._close_mindfulness_final_dialog()
         self.mindfulness_active = False
         self.mindfulness_paused = False
         self.mindfulness_prompt_pending = False
+        self.mindfulness_final_prompt_pending = False
         self.mindfulness_remaining_seconds = float(MINDFULNESS_TOTAL_SECONDS)
         self.mindfulness_elapsed_seconds = 0.0
         self.mindfulness_last_tick_monotonic = None
+        self.mindfulness_session_start_epoch = None
         self.mindfulness_phase = phase
         self.mindfulness_status_reason = reason
         self.mindfulness_completed_checkins = 0
@@ -1040,6 +1074,9 @@ class EngagementApp:
         elif self.pomodoro_phase == "paused":
             accent = COLORS["amber"]
             surface = COLORS["amber_soft"]
+        elif self.pomodoro_phase == "reflect":
+            accent = COLORS["blue"]
+            surface = COLORS["blue_soft"]
         elif self.pomodoro_phase == "complete":
             accent = COLORS["green"]
             surface = COLORS["green_soft"]
@@ -1116,6 +1153,8 @@ class EngagementApp:
             and not self.mindfulness_active
             and not self.mindfulness_paused
             and not self.mindfulness_prompt_pending
+            and not self.mindfulness_final_prompt_pending
+            and self.mindfulness_final_dialog is None
         )
         if self.mindfulness_phase == "running":
             accent = COLORS["green"]
@@ -1123,6 +1162,9 @@ class EngagementApp:
         elif self.mindfulness_phase == "paused":
             accent = COLORS["amber"]
             surface = COLORS["amber_soft"]
+        elif self.mindfulness_phase == "reflect":
+            accent = COLORS["blue"]
+            surface = COLORS["blue_soft"]
         elif self.mindfulness_phase == "complete":
             accent = COLORS["blue"]
             surface = COLORS["blue_soft"]
@@ -1179,21 +1221,41 @@ class EngagementApp:
         if not hasattr(self, "start_pomodoro_button"):
             return
 
-        pomodoro_open = self.pomodoro_active or self.checkin_dialog is not None
+        pomodoro_open = (
+            self.pomodoro_active
+            or self.checkin_dialog is not None
+            or self.pomodoro_final_dialog is not None
+            or self.pomodoro_final_prompt_pending
+        )
+        pomodoro_stoppable = self.pomodoro_active or self.checkin_dialog is not None or self.pomodoro_prompt_pending
         if camera_live and self.pomodoro_supported and not pomodoro_open:
             self.start_pomodoro_button.configure(state="normal", bg=COLORS["blue_soft"], fg=COLORS["blue"])
         else:
             self.start_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
 
-        if camera_live and pomodoro_open:
+        if camera_live and pomodoro_stoppable:
             self.stop_pomodoro_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
         else:
             self.stop_pomodoro_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
 
-        mindfulness_open = self.mindfulness_active or self.mindfulness_checkin_dialog is not None or self.mindfulness_prompt_pending
+        mindfulness_open = (
+            self.mindfulness_active
+            or self.mindfulness_checkin_dialog is not None
+            or self.mindfulness_prompt_pending
+            or self.mindfulness_final_dialog is not None
+            or self.mindfulness_final_prompt_pending
+        )
+        mindfulness_stoppable = (
+            self.mindfulness_active
+            or self.mindfulness_checkin_dialog is not None
+            or self.mindfulness_prompt_pending
+        )
         if mindfulness_open:
             self.start_mindfulness_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
-            self.stop_mindfulness_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
+            if camera_live and mindfulness_stoppable:
+                self.stop_mindfulness_button.configure(state="normal", bg=COLORS["red_soft"], fg=COLORS["red"])
+            else:
+                self.stop_mindfulness_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
         elif camera_live:
             self.start_mindfulness_button.configure(
                 state="normal",
@@ -1210,6 +1272,24 @@ class EngagementApp:
             return
         if not mindfulness_open:
             self.stop_mindfulness_button.configure(state="disabled", bg=COLORS["panel_soft"], fg=COLORS["text_soft"])
+
+    def _modal_dialogs(self) -> tuple[tk.Toplevel | None, ...]:
+        return (
+            self.checkin_dialog,
+            self.mindfulness_checkin_dialog,
+            self.pomodoro_final_dialog,
+            self.mindfulness_final_dialog,
+        )
+
+    def _open_pending_reflection_dialogs(self) -> None:
+        active_modal = any(dialog is not None for dialog in self._modal_dialogs())
+        if active_modal:
+            return
+        if self.pomodoro_final_prompt_pending and self.pomodoro_final_dialog is None:
+            self._open_pomodoro_final_dialog()
+            return
+        if self.mindfulness_final_prompt_pending and self.mindfulness_final_dialog is None:
+            self._open_mindfulness_final_dialog()
 
     def _record_pomodoro_frame_sample(self, frame: np.ndarray, timestamp: float | None = None) -> None:
         if not self.pomodoro_active or self.pomodoro_paused or not self.pomodoro_supported:
@@ -1352,15 +1432,7 @@ class EngagementApp:
             self.pomodoro_recent_block_profiles.append(block_profile)
         self.pomodoro_completed_blocks += 1
         if self.pomodoro_completed_blocks >= 3:
-            self.pomodoro_active = False
-            self.pomodoro_phase = "complete"
-            self.pomodoro_status_reason = status_reason
-            self.pomodoro_remaining_seconds = 0.0
-            self.pomodoro_block_elapsed_seconds = float(POMODORO_BLOCK_SECONDS)
-            self.pomodoro_current_block_index = 2
-            self._reset_pomodoro_block_capture()
-            self._refresh_pomodoro_ui()
-            self._sync_control_states()
+            self._begin_pomodoro_final_reflection()
             return
 
         self.pomodoro_current_block_index = self.pomodoro_completed_blocks
@@ -1387,6 +1459,74 @@ class EngagementApp:
             pass
         self.checkin_dialog = None
         self._sync_control_states()
+
+    def _close_pomodoro_final_dialog(self) -> None:
+        if self.pomodoro_final_dialog is None:
+            return
+        try:
+            self.pomodoro_final_dialog.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            self.pomodoro_final_dialog.destroy()
+        except tk.TclError:
+            pass
+        self.pomodoro_final_dialog = None
+        self._sync_control_states()
+
+    def _begin_pomodoro_final_reflection(self) -> None:
+        self.pomodoro_active = False
+        self.pomodoro_paused = False
+        self.pomodoro_prompt_pending = False
+        self.pomodoro_final_prompt_pending = True
+        self.pomodoro_phase = "reflect"
+        self.pomodoro_status_reason = "The 24-minute Pomodoro just ended. Add one quick overall reflection or skip it."
+        self.pomodoro_remaining_seconds = 0.0
+        self.pomodoro_block_elapsed_seconds = float(POMODORO_BLOCK_SECONDS)
+        self.pomodoro_current_block_index = 2
+        self.pomodoro_last_tick_monotonic = None
+        self._reset_pomodoro_block_capture()
+        self._refresh_pomodoro_ui()
+        self._sync_control_states()
+        self._open_pending_reflection_dialogs()
+
+    def _finish_pomodoro_final_reflection(self, status_reason: str) -> None:
+        self.pomodoro_final_prompt_pending = False
+        self.pomodoro_phase = "complete"
+        self.pomodoro_status_reason = status_reason
+        self.pomodoro_remaining_seconds = 0.0
+        self.pomodoro_block_elapsed_seconds = float(POMODORO_BLOCK_SECONDS)
+        self._refresh_pomodoro_ui()
+        self._sync_control_states()
+
+    def _skip_pomodoro_final_reflection(self) -> None:
+        self._close_pomodoro_final_dialog()
+        self.feedback_status_var.set("Latest: Pomodoro final reflection skipped.")
+        self._finish_pomodoro_final_reflection("Pomodoro complete. Final reflection skipped.")
+
+    def _submit_pomodoro_final_reflection(self, rating: int, outcome_tag: str) -> None:
+        resolved_rating = int(rating)
+        resolved_outcome = str(outcome_tag).strip()
+        summary = (
+            f"Overall Pomodoro reflection after {POMODORO_TOTAL_MINUTES} minutes: "
+            f"{resolved_outcome} (rating {resolved_rating}/5)."
+        )
+        self.feedback_manager.log_session_experience(
+            mode="pomodoro",
+            feedback_source=POMODORO_FINAL_FEEDBACK_SOURCE,
+            rating=resolved_rating,
+            outcome_tag=resolved_outcome,
+            summary=summary,
+            window_start_epoch=self.pomodoro_session_start_epoch,
+            window_end_epoch=time.time(),
+            practice_id=self.pomodoro_current_practice_id,
+            completed_blocks=self.pomodoro_completed_blocks,
+        )
+        self._close_pomodoro_final_dialog()
+        self.feedback_status_var.set("Latest: Pomodoro final reflection saved.")
+        self._finish_pomodoro_final_reflection(
+            f"Pomodoro complete. Final reflection saved: {resolved_outcome}."
+        )
 
     def _skip_pomodoro_checkin(self) -> None:
         block_number = self.pomodoro_current_block_index + 1
@@ -1467,6 +1607,12 @@ class EngagementApp:
         if self.checkin_dialog is not None:
             self.checkin_dialog.lift()
             self.checkin_dialog.focus_force()
+            return
+        if (
+            self.mindfulness_checkin_dialog is not None
+            or self.pomodoro_final_dialog is not None
+            or self.mindfulness_final_dialog is not None
+        ):
             return
 
         dialog = tk.Toplevel(self.root)
@@ -1574,6 +1720,140 @@ class EngagementApp:
 
         dialog.protocol("WM_DELETE_WINDOW", self._skip_pomodoro_checkin)
 
+    def _open_pomodoro_final_dialog(self) -> None:
+        if self.pomodoro_final_dialog is not None:
+            self.pomodoro_final_dialog.lift()
+            self.pomodoro_final_dialog.focus_force()
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Pomodoro Reflection")
+        dialog.configure(bg=COLORS["panel"])
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        self.pomodoro_final_dialog = dialog
+        self._sync_control_states()
+
+        container = tk.Frame(dialog, bg=COLORS["panel"])
+        container.pack(fill="both", expand=True, padx=22, pady=22)
+
+        tk.Label(container, text="Pomodoro Wrap-Up", bg=COLORS["panel"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 18)).pack(anchor="w")
+        tk.Label(
+            container,
+            text="How was the full 24-minute Pomodoro overall? This stays analytics-only and does not enter model training.",
+            bg=COLORS["panel"],
+            fg=COLORS["text_soft"],
+            justify="left",
+            wraplength=560,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(8, 16))
+
+        rating_var = tk.StringVar(value="3")
+        outcome_var = tk.StringVar(value="No clear shift")
+
+        rating_row = self._create_card(container, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+        rating_row.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            rating_row,
+            text="Overall rating",
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w", padx=16, pady=(14, 8))
+        rating_buttons = tk.Frame(rating_row, bg=COLORS["panel_alt"])
+        rating_buttons.pack(fill="x", padx=12, pady=(0, 14))
+        for column, (value, label) in enumerate(FINAL_EXPERIENCE_RATING_OPTIONS):
+            rating_buttons.grid_columnconfigure(column, weight=1)
+            tk.Radiobutton(
+                rating_buttons,
+                text=f"{value}\n{label}",
+                variable=rating_var,
+                value=value,
+                indicatoron=False,
+                bg=COLORS["panel_soft"],
+                fg=COLORS["text"],
+                activebackground=mix_color(COLORS["blue_soft"], "#ffffff", 0.06),
+                activeforeground=COLORS["text"],
+                selectcolor=COLORS["blue_soft"],
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=10,
+                font=("Segoe UI Semibold", 9),
+                highlightthickness=0,
+                cursor="hand2",
+                justify="center",
+            ).grid(row=0, column=column, sticky="ew", padx=4)
+
+        outcome_row = self._create_card(container, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+        outcome_row.pack(fill="x")
+        tk.Label(
+            outcome_row,
+            text="What shifted most?",
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w", padx=16, pady=(14, 8))
+        outcome_buttons = tk.Frame(outcome_row, bg=COLORS["panel_alt"])
+        outcome_buttons.pack(fill="x", padx=12, pady=(0, 14))
+        for column, label in enumerate(POMODORO_FINAL_OUTCOME_TAGS):
+            outcome_buttons.grid_columnconfigure(column, weight=1)
+            tk.Radiobutton(
+                outcome_buttons,
+                text=label,
+                variable=outcome_var,
+                value=label,
+                indicatoron=False,
+                bg=COLORS["panel_soft"],
+                fg=COLORS["text"],
+                activebackground=mix_color(COLORS["blue_soft"], "#ffffff", 0.06),
+                activeforeground=COLORS["text"],
+                selectcolor=COLORS["blue_soft"],
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=10,
+                font=("Segoe UI Semibold", 9),
+                highlightthickness=0,
+                cursor="hand2",
+            ).grid(row=0, column=column, sticky="ew", padx=4)
+
+        action_row = tk.Frame(container, bg=COLORS["panel"])
+        action_row.pack(fill="x", pady=(18, 0))
+        tk.Button(
+            action_row,
+            text="Submit",
+            command=lambda: self._submit_pomodoro_final_reflection(int(rating_var.get()), outcome_var.get()),
+            bg=COLORS["green"],
+            fg=COLORS["text"],
+            activebackground=mix_color(COLORS["green"], "#ffffff", 0.12),
+            activeforeground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+            cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
+            action_row,
+            text="Skip",
+            command=self._skip_pomodoro_final_reflection,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=mix_color(COLORS["panel_alt"], "#ffffff", 0.08),
+            activeforeground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+            cursor="hand2",
+        ).pack(side="left", padx=(10, 0))
+
+        dialog.protocol("WM_DELETE_WINDOW", self._skip_pomodoro_final_reflection)
+
     def _update_pomodoro_timer(self) -> None:
         if not self.pomodoro_active:
             return
@@ -1616,6 +1896,20 @@ class EngagementApp:
         except tk.TclError:
             pass
         self.mindfulness_checkin_dialog = None
+        self._sync_control_states()
+
+    def _close_mindfulness_final_dialog(self) -> None:
+        if self.mindfulness_final_dialog is None:
+            return
+        try:
+            self.mindfulness_final_dialog.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            self.mindfulness_final_dialog.destroy()
+        except tk.TclError:
+            pass
+        self.mindfulness_final_dialog = None
         self._sync_control_states()
 
     def _advance_mindfulness_after_checkin(
@@ -1671,12 +1965,68 @@ class EngagementApp:
             selection=selection,
         )
 
+    def _begin_mindfulness_final_reflection(self) -> None:
+        self.mindfulness_active = False
+        self.mindfulness_paused = False
+        self.mindfulness_prompt_pending = False
+        self.mindfulness_final_prompt_pending = True
+        self.mindfulness_phase = "reflect"
+        self.mindfulness_remaining_seconds = 0.0
+        self.mindfulness_elapsed_seconds = float(MINDFULNESS_TOTAL_SECONDS)
+        self.mindfulness_last_tick_monotonic = None
+        self.mindfulness_status_reason = "The 8-minute mindfulness reset just ended. Add one quick overall reflection or skip it."
+        self._refresh_mindfulness_ui()
+        self._sync_control_states()
+        self._open_pending_reflection_dialogs()
+
+    def _finish_mindfulness_final_reflection(self, status_reason: str) -> None:
+        self.mindfulness_final_prompt_pending = False
+        self.mindfulness_phase = "complete"
+        self.mindfulness_status_reason = status_reason
+        self.mindfulness_remaining_seconds = 0.0
+        self.mindfulness_elapsed_seconds = float(MINDFULNESS_TOTAL_SECONDS)
+        self._refresh_mindfulness_ui()
+        self._sync_control_states()
+
+    def _skip_mindfulness_final_reflection(self) -> None:
+        self._close_mindfulness_final_dialog()
+        self.feedback_status_var.set("Latest: Mindfulness final reflection skipped.")
+        self._finish_mindfulness_final_reflection("Mindfulness reset complete. Final reflection skipped.")
+
+    def _submit_mindfulness_final_reflection(self, rating: int, outcome_tag: str) -> None:
+        resolved_rating = int(rating)
+        resolved_outcome = str(outcome_tag).strip()
+        summary = (
+            f"Overall mindfulness reflection after {MINDFULNESS_TOTAL_MINUTES} minutes: "
+            f"{resolved_outcome} (rating {resolved_rating}/5)."
+        )
+        self.feedback_manager.log_session_experience(
+            mode="mindfulness",
+            feedback_source=MINDFULNESS_FINAL_FEEDBACK_SOURCE,
+            rating=resolved_rating,
+            outcome_tag=resolved_outcome,
+            summary=summary,
+            window_start_epoch=self.mindfulness_session_start_epoch,
+            window_end_epoch=time.time(),
+            practice_id=self.mindfulness_segment_practice_id,
+            completed_checkins=self.mindfulness_completed_checkins,
+        )
+        self._close_mindfulness_final_dialog()
+        self.feedback_status_var.set("Latest: Mindfulness final reflection saved.")
+        self._finish_mindfulness_final_reflection(
+            f"Mindfulness reset complete. Final reflection saved: {resolved_outcome}."
+        )
+
     def _open_mindfulness_checkin(self) -> None:
         if self.mindfulness_checkin_dialog is not None:
             self.mindfulness_checkin_dialog.lift()
             self.mindfulness_checkin_dialog.focus_force()
             return
-        if self.checkin_dialog is not None:
+        if (
+            self.checkin_dialog is not None
+            or self.pomodoro_final_dialog is not None
+            or self.mindfulness_final_dialog is not None
+        ):
             return
 
         dialog = tk.Toplevel(self.root)
@@ -1798,6 +2148,140 @@ class EngagementApp:
 
         dialog.protocol("WM_DELETE_WINDOW", self._skip_mindfulness_checkin)
 
+    def _open_mindfulness_final_dialog(self) -> None:
+        if self.mindfulness_final_dialog is not None:
+            self.mindfulness_final_dialog.lift()
+            self.mindfulness_final_dialog.focus_force()
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Mindfulness Reflection")
+        dialog.configure(bg=COLORS["panel"])
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        self.mindfulness_final_dialog = dialog
+        self._sync_control_states()
+
+        container = tk.Frame(dialog, bg=COLORS["panel"])
+        container.pack(fill="both", expand=True, padx=22, pady=22)
+
+        tk.Label(container, text="Mindfulness Wrap-Up", bg=COLORS["panel"], fg=COLORS["text"], font=("Bahnschrift SemiBold", 18)).pack(anchor="w")
+        tk.Label(
+            container,
+            text="How did the full 8-minute reset feel overall? This stays analytics-only and does not enter model training.",
+            bg=COLORS["panel"],
+            fg=COLORS["text_soft"],
+            justify="left",
+            wraplength=560,
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(8, 16))
+
+        rating_var = tk.StringVar(value="3")
+        outcome_var = tk.StringVar(value="No clear shift")
+
+        rating_row = self._create_card(container, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+        rating_row.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            rating_row,
+            text="Overall rating",
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w", padx=16, pady=(14, 8))
+        rating_buttons = tk.Frame(rating_row, bg=COLORS["panel_alt"])
+        rating_buttons.pack(fill="x", padx=12, pady=(0, 14))
+        for column, (value, label) in enumerate(FINAL_EXPERIENCE_RATING_OPTIONS):
+            rating_buttons.grid_columnconfigure(column, weight=1)
+            tk.Radiobutton(
+                rating_buttons,
+                text=f"{value}\n{label}",
+                variable=rating_var,
+                value=value,
+                indicatoron=False,
+                bg=COLORS["panel_soft"],
+                fg=COLORS["text"],
+                activebackground=mix_color(COLORS["green_soft"], "#ffffff", 0.06),
+                activeforeground=COLORS["text"],
+                selectcolor=COLORS["green_soft"],
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=10,
+                font=("Segoe UI Semibold", 9),
+                highlightthickness=0,
+                cursor="hand2",
+                justify="center",
+            ).grid(row=0, column=column, sticky="ew", padx=4)
+
+        outcome_row = self._create_card(container, bg=COLORS["panel_alt"], border=COLORS["border_soft"])
+        outcome_row.pack(fill="x")
+        tk.Label(
+            outcome_row,
+            text="What shifted most?",
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w", padx=16, pady=(14, 8))
+        outcome_buttons = tk.Frame(outcome_row, bg=COLORS["panel_alt"])
+        outcome_buttons.pack(fill="x", padx=12, pady=(0, 14))
+        for column, label in enumerate(MINDFULNESS_FINAL_OUTCOME_TAGS):
+            outcome_buttons.grid_columnconfigure(column, weight=1)
+            tk.Radiobutton(
+                outcome_buttons,
+                text=label,
+                variable=outcome_var,
+                value=label,
+                indicatoron=False,
+                bg=COLORS["panel_soft"],
+                fg=COLORS["text"],
+                activebackground=mix_color(COLORS["green_soft"], "#ffffff", 0.06),
+                activeforeground=COLORS["text"],
+                selectcolor=COLORS["green_soft"],
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=10,
+                font=("Segoe UI Semibold", 9),
+                highlightthickness=0,
+                cursor="hand2",
+            ).grid(row=0, column=column, sticky="ew", padx=4)
+
+        action_row = tk.Frame(container, bg=COLORS["panel"])
+        action_row.pack(fill="x", pady=(18, 0))
+        tk.Button(
+            action_row,
+            text="Submit",
+            command=lambda: self._submit_mindfulness_final_reflection(int(rating_var.get()), outcome_var.get()),
+            bg=COLORS["green"],
+            fg=COLORS["text"],
+            activebackground=mix_color(COLORS["green"], "#ffffff", 0.12),
+            activeforeground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+            cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
+            action_row,
+            text="Skip",
+            command=self._skip_mindfulness_final_reflection,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=mix_color(COLORS["panel_alt"], "#ffffff", 0.08),
+            activeforeground=COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            font=("Segoe UI Semibold", 10),
+            cursor="hand2",
+        ).pack(side="left", padx=(10, 0))
+
+        dialog.protocol("WM_DELETE_WINDOW", self._skip_mindfulness_final_reflection)
+
     def _update_mindfulness_timer(self) -> None:
         if not self.mindfulness_active:
             return
@@ -1821,15 +2305,8 @@ class EngagementApp:
         self.mindfulness_elapsed_seconds = min(float(MINDFULNESS_TOTAL_SECONDS), self.mindfulness_elapsed_seconds + delta)
         self.mindfulness_phase = "running"
         if self.mindfulness_elapsed_seconds >= float(MINDFULNESS_TOTAL_SECONDS):
-            self.mindfulness_active = False
-            self.mindfulness_paused = False
-            self.mindfulness_prompt_pending = False
-            self.mindfulness_phase = "complete"
-            self.mindfulness_remaining_seconds = 0.0
-            self.mindfulness_elapsed_seconds = float(MINDFULNESS_TOTAL_SECONDS)
-            self.mindfulness_last_tick_monotonic = None
-            self.mindfulness_status_reason = "The 8-minute mindfulness reset is complete."
-            self._sync_control_states()
+            self._begin_mindfulness_final_reflection()
+            return
         elif (
             self.mindfulness_next_checkin_elapsed_seconds is not None
             and self.mindfulness_elapsed_seconds >= self.mindfulness_next_checkin_elapsed_seconds
@@ -1850,7 +2327,7 @@ class EngagementApp:
             self.feedback_status_var.set("Latest: Pomodoro check-ins need the multi-affect model.")
             self._refresh_pomodoro_ui()
             return
-        if self.pomodoro_active or self.checkin_dialog is not None:
+        if self.pomodoro_active or self.checkin_dialog is not None or self.pomodoro_final_prompt_pending or self.pomodoro_final_dialog is not None:
             return
         if not self.running:
             self.feedback_status_var.set("Latest: Start the camera before starting Pomodoro.")
@@ -1860,6 +2337,7 @@ class EngagementApp:
         self.pomodoro_active = True
         self.pomodoro_paused = False
         self.pomodoro_prompt_pending = False
+        self.pomodoro_final_prompt_pending = False
         self.pomodoro_phase = "running"
         self.pomodoro_status_reason = ""
         self.pomodoro_completed_blocks = 0
@@ -1892,7 +2370,13 @@ class EngagementApp:
         self._sync_control_states()
 
     def start_mindfulness(self) -> None:
-        if self.mindfulness_active or self.mindfulness_checkin_dialog is not None or self.mindfulness_prompt_pending:
+        if (
+            self.mindfulness_active
+            or self.mindfulness_checkin_dialog is not None
+            or self.mindfulness_prompt_pending
+            or self.mindfulness_final_prompt_pending
+            or self.mindfulness_final_dialog is not None
+        ):
             return
         if not self.running:
             self.feedback_status_var.set("Latest: Start the camera before starting mindfulness.")
@@ -1901,10 +2385,12 @@ class EngagementApp:
         self.mindfulness_active = True
         self.mindfulness_paused = False
         self.mindfulness_prompt_pending = False
+        self.mindfulness_final_prompt_pending = False
         self.mindfulness_phase = "running"
         self.mindfulness_remaining_seconds = float(MINDFULNESS_TOTAL_SECONDS)
         self.mindfulness_elapsed_seconds = 0.0
         self.mindfulness_last_tick_monotonic = time.monotonic()
+        self.mindfulness_session_start_epoch = time.time()
         self.mindfulness_status_reason = ""
         self.mindfulness_completed_checkins = 0
         self.mindfulness_next_checkin_elapsed_seconds = (
@@ -1994,12 +2480,12 @@ class EngagementApp:
     def _on_mousewheel(self, event):
         if self.scroll_canvas is None:
             return
-        if self.checkin_dialog is not None or self.mindfulness_checkin_dialog is not None:
+        if any(dialog is not None for dialog in self._modal_dialogs()):
             widget = getattr(event, "widget", None)
             if widget is not None:
                 try:
                     dialog = widget.winfo_toplevel()
-                    if dialog is self.checkin_dialog or dialog is self.mindfulness_checkin_dialog:
+                    if dialog in self._modal_dialogs():
                         return
                 except tk.TclError:
                     return
@@ -3542,6 +4028,7 @@ class EngagementApp:
         if not self.running:
             self._update_pomodoro_timer()
             self._update_mindfulness_timer()
+            self._open_pending_reflection_dialogs()
             self._schedule_ui()
             return
 
@@ -3580,6 +4067,7 @@ class EngagementApp:
 
         self._update_pomodoro_timer()
         self._update_mindfulness_timer()
+        self._open_pending_reflection_dialogs()
         self._schedule_ui()
 
     def on_close(self) -> None:
@@ -3596,6 +4084,8 @@ class EngagementApp:
             self.ui_after_id = None
         self._close_checkin_dialog()
         self._close_mindfulness_checkin_dialog()
+        self._close_pomodoro_final_dialog()
+        self._close_mindfulness_final_dialog()
         self.stop()
         self.root.destroy()
 

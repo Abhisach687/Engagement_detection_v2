@@ -324,6 +324,21 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual(view.next_text, "Current practice: Worked Example + Self-Explain (Scaffolded)")
         self.assertIn("held until submit or skip", view.note_text)
 
+    def test_pomodoro_view_formats_reflect_state(self) -> None:
+        view = pomodoro_timer_view(
+            supported=True,
+            phase="reflect",
+            remaining_seconds=0,
+            block_elapsed_seconds=POMODORO_BLOCK_SECONDS,
+            completed_blocks=3,
+            current_block_index=2,
+        )
+
+        self.assertEqual(view.status, "Reflection")
+        self.assertEqual(view.block_text, "Session complete")
+        self.assertIn("final reflection", view.next_text.lower())
+        self.assertEqual(view.current_progress, 1.0)
+
     def test_pomodoro_view_formats_stopped_state(self) -> None:
         view = pomodoro_timer_view(
             supported=True,
@@ -379,6 +394,18 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual(view.block_text, "Mindfulness steer-in")
         self.assertEqual(view.next_text, "Current practice: Focused Breath Counting")
         self.assertIn("next 1.8 minutes", view.note_text)
+
+    def test_mindfulness_view_formats_reflect_state(self) -> None:
+        view = mindfulness_timer_view(
+            phase="reflect",
+            remaining_seconds=0,
+            elapsed_seconds=MINDFULNESS_TOTAL_SECONDS,
+        )
+
+        self.assertEqual(view.status, "Reflection")
+        self.assertEqual(view.block_text, "Reset complete")
+        self.assertIn("final reflection", view.next_text.lower())
+        self.assertEqual(view.progress, 1.0)
 
     def test_mindfulness_view_formats_complete_state(self) -> None:
         view = mindfulness_timer_view(

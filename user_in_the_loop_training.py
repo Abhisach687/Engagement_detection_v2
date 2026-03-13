@@ -111,6 +111,24 @@ class FeedbackRecord:
 
 
 @dataclass
+class SessionExperienceRecord:
+    experience_id: str
+    session_id: str
+    created_at: str
+    created_at_epoch: float
+    mode: str
+    feedback_source: str
+    rating: int
+    outcome_tag: str
+    summary: str
+    window_start_epoch: float | None = None
+    window_end_epoch: float | None = None
+    practice_id: str | None = None
+    completed_blocks: int | None = None
+    completed_checkins: int | None = None
+
+
+@dataclass
 class ThresholdState:
     session_id: str
     review_count: int = 0
@@ -272,6 +290,7 @@ class FeedbackManager:
         self.exports_dir = self.feedback_root / "exports"
         self.candidates_dir = self.feedback_root / "candidates"
         self.log_path = self.feedback_root / "feedback_log.jsonl"
+        self.session_experience_log_path = self.feedback_root / "session_experiences.jsonl"
         self.state_path = self.feedback_root / "session_state.json"
         for folder in (self.feedback_root, self.clips_dir, self.exports_dir, self.candidates_dir):
             folder.mkdir(parents=True, exist_ok=True)
@@ -584,6 +603,47 @@ class FeedbackManager:
         self._persist_state()
         return record
 
+    def log_session_experience(
+        self,
+        *,
+        mode: str,
+        feedback_source: str,
+        rating: int,
+        outcome_tag: str,
+        summary: str,
+        window_start_epoch: float | None = None,
+        window_end_epoch: float | None = None,
+        practice_id: str | None = None,
+        completed_blocks: int | None = None,
+        completed_checkins: int | None = None,
+    ) -> SessionExperienceRecord:
+        mode = str(mode).strip().lower()
+        if mode not in {"mindfulness", "pomodoro"}:
+            raise ValueError("Mode must be 'mindfulness' or 'pomodoro'.")
+        rating = int(rating)
+        if rating < 1 or rating > 5:
+            raise ValueError("Rating must be between 1 and 5.")
+
+        created_at, created_at_epoch = _utcnow()
+        record = SessionExperienceRecord(
+            experience_id=f"{int(created_at_epoch * 1000)}_{uuid.uuid4().hex[:8]}",
+            session_id=self.state.session_id,
+            created_at=created_at,
+            created_at_epoch=created_at_epoch,
+            mode=mode,
+            feedback_source=str(feedback_source),
+            rating=rating,
+            outcome_tag=str(outcome_tag),
+            summary=str(summary),
+            window_start_epoch=None if window_start_epoch is None else float(window_start_epoch),
+            window_end_epoch=None if window_end_epoch is None else float(window_end_epoch),
+            practice_id=None if practice_id is None else str(practice_id),
+            completed_blocks=None if completed_blocks is None else int(completed_blocks),
+            completed_checkins=None if completed_checkins is None else int(completed_checkins),
+        )
+        _append_jsonl(self.session_experience_log_path, asdict(record))
+        return record
+
     def _save_clip(self, feedback_id: str, frames: list[np.ndarray]) -> Path:
         rgb_frames = [np.ascontiguousarray(frame[:, :, ::-1]) for frame in frames]
         clip = np.stack(rgb_frames, axis=0).astype(np.uint8)
@@ -699,6 +759,15 @@ class FeedbackManager:
 
     def all_feedback(self) -> list[dict[str, Any]]:
         return [self._normalize_feedback_row(record) for record in _read_jsonl(self.log_path)]
+
+    def recent_session_experiences(self, mode: str, limit: int = 5) -> list[dict[str, Any]]:
+        normalized_mode = str(mode).strip().lower()
+        experiences = [
+            dict(record)
+            for record in _read_jsonl(self.session_experience_log_path)
+            if str(record.get("mode", "")).strip().lower() == normalized_mode
+        ]
+        return list(reversed(experiences))[: max(0, int(limit))]
 
     def summarize_feedback(self) -> dict[str, Any]:
         records = self.all_feedback()
