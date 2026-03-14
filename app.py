@@ -2789,6 +2789,8 @@ class EngagementApp:
         bottom_width = max(360, self.bottom_band.winfo_width())
         tile_width = max(220, int((self.tiles_frame.winfo_width() or bottom_width) / max(1, self.signal_tile_layout_columns or len(self.signal_tile_order) or 1)))
         timer_width = max(220, decision_width - 72 if self.timer_cards_stacked else int((decision_width - 96) / 2))
+        pomodoro_width = max(220, (self.pomodoro_card.winfo_width() or timer_width) - 32)
+        mindfulness_width = max(220, (self.mindfulness_card.winfo_width() or timer_width) - 32)
 
         headline_wrap = max(260, decision_width - 72)
         headline_size = 30 if decision_width >= 560 else 28 if decision_width >= 500 else 26 if decision_width >= 440 else 24
@@ -2799,10 +2801,10 @@ class EngagementApp:
         self.summary_label.configure(wraplength=max(240, decision_width - 72))
         self.spotlight_detail_label.configure(wraplength=max(240, decision_width - 72))
         self.spotlight_value.configure(font=("Bahnschrift SemiBold", 18 if decision_width >= 440 else 16))
-        self.pomodoro_next_label.configure(wraplength=max(220, timer_width - 36))
-        self.pomodoro_note_label.configure(wraplength=max(180, timer_width - 36))
-        self.mindfulness_next_label.configure(wraplength=max(220, timer_width - 36))
-        self.mindfulness_note_label.configure(wraplength=max(180, timer_width - 36))
+        self.pomodoro_next_label.configure(wraplength=max(180, pomodoro_width - 12))
+        self.pomodoro_note_label.configure(wraplength=max(180, pomodoro_width - 12))
+        self.mindfulness_next_label.configure(wraplength=max(180, mindfulness_width - 12))
+        self.mindfulness_note_label.configure(wraplength=max(180, mindfulness_width - 12))
         self.preview_footer.configure(wraplength=max(260, preview_width - 40))
         self.bottom_meta_label.configure(wraplength=max(240, bottom_width - 40))
         self.engagement_summary_note_label.configure(wraplength=max(260, bottom_width - 40))
