@@ -53,49 +53,49 @@ class GuidanceTests(unittest.TestCase):
             _profile(engagement="Medium", confusion="High", frustration="High")
         )
         self.assertEqual(selection.practice_id, "brief_reset_then_resume")
-        self.assertIn("de-escalate", selection.why_selected)
+        self.assertIn("overload", selection.why_selected.lower())
 
     def test_pomodoro_selector_for_worked_example_scaffold(self) -> None:
         selection = select_pomodoro_practice(
             _profile(engagement="Medium", confusion="High", frustration="Low")
         )
         self.assertEqual(selection.practice_id, "worked_example_self_explain")
-        self.assertIn("worked example", selection.next_action.lower())
+        self.assertIn("open one example", selection.next_action.lower())
 
     def test_pomodoro_selector_for_frustration_spike(self) -> None:
         selection = select_pomodoro_practice(
             _profile(engagement="Medium", confusion="Low", frustration="Very High")
         )
         self.assertEqual(selection.practice_id, "brief_reset_then_resume")
-        self.assertIn("mindfulness reset", selection.next_action.lower())
+        self.assertIn("mindfulness", selection.next_action.lower())
 
     def test_pomodoro_selector_for_bored_underchallenge(self) -> None:
         selection = select_pomodoro_practice(
             _profile(engagement="High", boredom="High", confusion="Low", frustration="Low")
         )
         self.assertEqual(selection.practice_id, "retrieval_sprint")
-        self.assertIn("active retrieval", selection.why_selected)
+        self.assertIn("raise challenge", selection.why_selected.lower())
 
     def test_pomodoro_selector_for_bored_disengaged(self) -> None:
         selection = select_pomodoro_practice(
             _profile(engagement="Low", boredom="Very High", confusion="Low", frustration="Low")
         )
         self.assertEqual(selection.practice_id, "implementation_restart")
-        self.assertIn("2-minute restart", selection.next_action)
+        self.assertIn("2-minute target", selection.next_action)
 
     def test_pomodoro_selector_for_low_engagement_fallback(self) -> None:
         selection = select_pomodoro_practice(
             _profile(state="live_not_engaged", engagement="Low", boredom="Medium", confusion="Low", frustration="Low")
         )
         self.assertEqual(selection.practice_id, "retrieval_sprint")
-        self.assertIn("active recall", selection.why_selected.lower())
+        self.assertIn("wake recall", selection.why_selected.lower())
 
     def test_pomodoro_selector_for_stable_focus(self) -> None:
         selection = select_pomodoro_practice(
             _profile(engagement="High", boredom="Low", confusion="Low", frustration="Low")
         )
         self.assertEqual(selection.practice_id, "stay_the_course")
-        self.assertIn("current task", selection.why_selected)
+        self.assertIn("steady", selection.why_selected.lower())
 
     def test_pomodoro_selector_can_escalate_repeated_confusion_to_error_review(self) -> None:
         selection = select_pomodoro_practice(
@@ -106,7 +106,7 @@ class GuidanceTests(unittest.TestCase):
             ),
         )
         self.assertEqual(selection.practice_id, "error_review_with_adaptable_feedback")
-        self.assertIn("across blocks", selection.why_selected)
+        self.assertIn("recent check-ins", selection.why_selected)
 
     def test_pomodoro_selector_holds_current_practice_without_persistent_shift(self) -> None:
         selection = select_pomodoro_practice(
@@ -155,8 +155,8 @@ class GuidanceTests(unittest.TestCase):
             _profile(engagement="Low", boredom="Very High", confusion="Low", frustration="Low")
         )
         self.assertEqual(cue.title, "Implementation Restart")
-        self.assertIn("if-then restart cue", cue.body)
-        self.assertIn("2-minute restart", cue.body)
+        self.assertIn("if-then cue", cue.body)
+        self.assertIn("2-minute target", cue.body)
 
     def test_mindfulness_selector_chooses_acceptance_for_high_frustration(self) -> None:
         selection = select_mindfulness_practice(
@@ -164,7 +164,7 @@ class GuidanceTests(unittest.TestCase):
             elapsed_seconds=120,
         )
         self.assertEqual(selection.practice_id, "acceptance_body_release")
-        self.assertIn("Frustration is elevated", selection.why_selected)
+        self.assertIn("overload", selection.why_selected.lower())
 
     def test_mindfulness_selector_chooses_focused_breath_counting_for_high_confusion(self) -> None:
         selection = select_mindfulness_practice(
@@ -172,7 +172,7 @@ class GuidanceTests(unittest.TestCase):
             elapsed_seconds=130,
         )
         self.assertEqual(selection.practice_id, "focused_breath_counting")
-        self.assertIn("Confusion is elevated", selection.why_selected)
+        self.assertIn("confusion", selection.why_selected.lower())
 
     def test_mindfulness_selector_chooses_curiosity_noting_for_high_boredom(self) -> None:
         selection = select_mindfulness_practice(
@@ -181,7 +181,7 @@ class GuidanceTests(unittest.TestCase):
         )
         self.assertEqual(selection.practice_id, "curiosity_noting")
         self.assertNotEqual(selection.practice_id, "open_monitoring")
-        self.assertIn("Boredom is elevated", selection.why_selected)
+        self.assertIn("restless boredom", selection.why_selected.lower())
 
     def test_mindfulness_selector_chooses_alert_anchor_for_low_engagement(self) -> None:
         selection = select_mindfulness_practice(
@@ -189,7 +189,7 @@ class GuidanceTests(unittest.TestCase):
             elapsed_seconds=20,
         )
         self.assertEqual(selection.practice_id, "alert_breath_anchor")
-        self.assertIn("Engagement is low", selection.why_selected)
+        self.assertIn("low alertness", selection.why_selected.lower())
 
     def test_mindfulness_selector_chooses_open_monitoring_for_settled_profile(self) -> None:
         selection = select_mindfulness_practice(
@@ -197,7 +197,7 @@ class GuidanceTests(unittest.TestCase):
             elapsed_seconds=360,
         )
         self.assertEqual(selection.practice_id, "open_monitoring")
-        self.assertIn("settled state", selection.why_selected)
+        self.assertIn("settled state", selection.why_selected.lower())
 
     def test_mindfulness_selector_uses_focused_breath_counting_without_live_affect(self) -> None:
         selection = select_mindfulness_practice(
@@ -215,7 +215,7 @@ class GuidanceTests(unittest.TestCase):
             recent_steering_keys=("restless",),
         )
         self.assertEqual(selection.practice_id, "loving_kindness_transition")
-        self.assertIn("repeated across steer-ins", selection.why_selected)
+        self.assertIn("repeated across steer-ins", selection.why_selected.lower())
 
     def test_mindfulness_guidance_for_high_boredom_uses_curiosity_noting(self) -> None:
         cue = mindfulness_guidance_for_profile(
@@ -224,7 +224,7 @@ class GuidanceTests(unittest.TestCase):
             phase="running",
         )
         self.assertEqual(cue.technique, "curiosity noting")
-        self.assertIn("curiosity", cue.body.lower())
+        self.assertIn("changing", cue.body.lower())
 
     def test_mindfulness_guidance_for_low_engagement_uses_alert_anchor(self) -> None:
         cue = mindfulness_guidance_for_profile(
@@ -233,7 +233,7 @@ class GuidanceTests(unittest.TestCase):
             phase="running",
         )
         self.assertEqual(cue.technique, "alert breath anchor")
-        self.assertIn("Sit taller", cue.body)
+        self.assertIn("Eyes open", cue.body)
 
     def test_mindfulness_guidance_for_settled_profile_uses_open_monitoring(self) -> None:
         cue = mindfulness_guidance_for_profile(
@@ -242,7 +242,7 @@ class GuidanceTests(unittest.TestCase):
             phase="running",
         )
         self.assertEqual(cue.technique, "open monitoring")
-        self.assertIn("full field", cue.body)
+        self.assertIn("full field", cue.body.lower())
 
     def test_mindfulness_guidance_for_repeated_negative_steer_in_uses_kindness(self) -> None:
         cue = mindfulness_guidance_for_profile(
@@ -299,8 +299,8 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual(view.next_text, "Practice: Retrieval Sprint (Challenge raised)")
         self.assertIn(f"Check-in in {format_clock(POMODORO_BLOCK_SECONDS - 90)}", view.block_text)
         self.assertIn("Why:", view.note_text)
-        self.assertIn("Exercise:", view.note_text)
-        self.assertIn("Next:", view.note_text)
+        self.assertIn("Practice:", view.note_text)
+        self.assertIn("Do:", view.note_text)
         self.assertGreater(view.current_progress, 0.0)
 
     def test_pomodoro_view_formats_paused_state_with_current_practice(self) -> None:
@@ -373,7 +373,7 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual(view.block_text, f"Next steer-in in {format_clock(MINDFULNESS_CHECKIN_INTERVAL_SECONDS - 22)}")
         self.assertEqual(view.next_text, "Practice: Open Monitoring")
         self.assertIn("Why: Engagement is steady", view.note_text)
-        self.assertIn("Next:", view.note_text)
+        self.assertIn("Do:", view.note_text)
         self.assertGreater(view.progress, 0.0)
 
     def test_mindfulness_view_formats_paused_checkin_state_with_current_practice(self) -> None:

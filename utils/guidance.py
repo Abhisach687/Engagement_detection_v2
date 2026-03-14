@@ -124,6 +124,19 @@ class MindfulnessTimerView:
     progress: float
 
 
+# Conservative signal map for the live selector. These sources support using
+# face/body-derived affect estimates to steer practice, while acknowledging that
+# confusion is more facially legible, boredom often shows more in posture/body
+# movement, and frustration is noisier without context.
+AFFECT_SIGNAL_EVIDENCE_MAP = {
+    "bosch_2015": "Naturalistic facial-expression models detected engagement, boredom, confusion, and frustration above chance in classroom learning.",
+    "dmello_body_2008": "Gross body language was especially informative for boredom, while facial cues were stronger for confusion.",
+    "confusion_face_2015": "Confusion during instructional video use was signaled by eye and eyebrow cues that could be detected automatically.",
+    "eastwood_2012": "Boredom is best understood as a failure to successfully engage attention with the current activity.",
+    "dmello_graesser_2012": "In complex learning, confusion can be productive if resolved, but unresolved confusion tends to frustration and then boredom.",
+}
+
+
 # Auditable offline evidence map for the static practice selector.
 POMODORO_EVIDENCE_MAP = {
     "nickl_baeuml_2023": "Retrieval practice reduced later forgetting across repeated tests.",
@@ -137,6 +150,10 @@ POMODORO_EVIDENCE_MAP = {
     "ariga_lleras_2011": "Rare brief breaks helped sustain vigilance over time.",
     "orbell_1997": "Implementation intentions improved follow-through on intended actions.",
     "wolfe_2023": "Ultra-brief mindfulness and reappraisal reduced stress before performance.",
+    "bosch_2015": AFFECT_SIGNAL_EVIDENCE_MAP["bosch_2015"],
+    "dmello_body_2008": AFFECT_SIGNAL_EVIDENCE_MAP["dmello_body_2008"],
+    "eastwood_2012": AFFECT_SIGNAL_EVIDENCE_MAP["eastwood_2012"],
+    "dmello_graesser_2012": AFFECT_SIGNAL_EVIDENCE_MAP["dmello_graesser_2012"],
 }
 
 
@@ -150,6 +167,10 @@ MINDFULNESS_EVIDENCE_MAP = {
     "wenzel_2021": "Non-judgmental acceptance predicted lower affect reactivity in daily life.",
     "roll_2020": "Body scan produced immediate anxiety reduction in a randomized crossover study.",
     "fredrickson_2008": "Loving-kindness increased positive emotions and downstream psychological resources.",
+    "bosch_2015": AFFECT_SIGNAL_EVIDENCE_MAP["bosch_2015"],
+    "dmello_body_2008": AFFECT_SIGNAL_EVIDENCE_MAP["dmello_body_2008"],
+    "confusion_face_2015": AFFECT_SIGNAL_EVIDENCE_MAP["confusion_face_2015"],
+    "eastwood_2012": AFFECT_SIGNAL_EVIDENCE_MAP["eastwood_2012"],
 }
 
 
@@ -160,10 +181,10 @@ POMODORO_PRACTICE_PROTOCOLS = {
         practice_family="retrieval_sprint",
         technique="retrieval practice",
         rationale_key="retrieval_sprint",
-        evidence_ids=("nickl_baeuml_2023", "smith_2016"),
+        evidence_ids=("nickl_baeuml_2023", "smith_2016", "eastwood_2012"),
         duration_seconds=180,
-        exercise_summary="Test yourself from memory instead of rereading so recall stays active and effortful.",
-        next_action="Close notes for 2-3 minutes, answer one prompt from memory, then reopen notes only to correct the misses.",
+        exercise_summary="Force recall now. Retrieval is stronger than rereading when you have drifted or the task feels too easy.",
+        next_action="Hide the notes. Answer one prompt from memory now. Reopen notes only to patch misses, then test again.",
     ),
     "productive_struggle_then_hint": PomodoroPracticeProtocol(
         practice_id="productive_struggle_then_hint",
@@ -171,10 +192,10 @@ POMODORO_PRACTICE_PROTOCOLS = {
         practice_family="productive_struggle_then_hint",
         technique="generation before hint",
         rationale_key="productive_struggle_then_hint",
-        evidence_ids=("dmello_2014", "kapur_2008", "kapur_bielaczyc_2012"),
+        evidence_ids=("dmello_2014", "kapur_2008", "kapur_bielaczyc_2012", "dmello_graesser_2012"),
         duration_seconds=150,
-        exercise_summary="Try generating the path yourself first, then use one hint only after the struggle window ends.",
-        next_action="Spend about 90 seconds generating a path yourself, then take exactly one hint or worked step and continue from there.",
+        exercise_summary="Stay in the struggle briefly. If confusion is still active after a short attempt, take one hint and keep moving.",
+        next_action="Work unaided for about 90 seconds. If you are still blocked, take exactly one hint or one worked step and continue.",
     ),
     "worked_example_self_explain": PomodoroPracticeProtocol(
         practice_id="worked_example_self_explain",
@@ -184,8 +205,8 @@ POMODORO_PRACTICE_PROTOCOLS = {
         rationale_key="worked_example_self_explain",
         evidence_ids=("renkl_1998", "heitzmann_2015"),
         duration_seconds=180,
-        exercise_summary="Study one example slowly and explain why each step works before applying it yourself.",
-        next_action="Use one worked example, pause on each line, and explain in your own words why that move is valid before copying anything.",
+        exercise_summary="Shrink the task. One example plus self-explanation is better than forcing more blind attempts when confusion stays high.",
+        next_action="Open one example. After each line, say why it works in your own words before you copy or adapt anything.",
     ),
     "error_review_with_adaptable_feedback": PomodoroPracticeProtocol(
         practice_id="error_review_with_adaptable_feedback",
@@ -195,8 +216,8 @@ POMODORO_PRACTICE_PROTOCOLS = {
         rationale_key="error_review_with_adaptable_feedback",
         evidence_ids=("renkl_1998", "heitzmann_2015"),
         duration_seconds=180,
-        exercise_summary="Use the latest mistake as the lesson and rebuild the rule with one targeted hint or comparison.",
-        next_action="Review the latest error, name what failed, compare it with one hint or example, then restate the rule you will use on the next attempt.",
+        exercise_summary="Use the last error as the lesson. Name the rule that failed, fix it, then try again with that rule in mind.",
+        next_action="Pull up the latest mistake. Name the exact failure. Compare it with one hint or example. Then restate the rule for the next try.",
     ),
     "implementation_restart": PomodoroPracticeProtocol(
         practice_id="implementation_restart",
@@ -204,10 +225,10 @@ POMODORO_PRACTICE_PROTOCOLS = {
         practice_family="implementation_restart",
         technique="implementation intention restart",
         rationale_key="implementation_restart",
-        evidence_ids=("orbell_1997", "tam_inzlicht_2024"),
+        evidence_ids=("orbell_1997", "tam_inzlicht_2024", "eastwood_2012"),
         duration_seconds=120,
-        exercise_summary="Use a concrete if-then restart cue to get back into the same task without switching away.",
-        next_action="Reset posture, remove one distraction, write one if-then start cue, and begin a 2-minute restart target on the same task.",
+        exercise_summary="Do not switch tasks. Use a concrete restart cue, posture reset, and one tiny target to get traction again.",
+        next_action="Sit up, remove one distraction, write one if-then cue, and start a 2-minute target on the same task right away.",
     ),
     "brief_rare_break": PomodoroPracticeProtocol(
         practice_id="brief_rare_break",
@@ -217,8 +238,8 @@ POMODORO_PRACTICE_PROTOCOLS = {
         rationale_key="brief_rare_break",
         evidence_ids=("ariga_lleras_2011", "tam_inzlicht_2024"),
         duration_seconds=60,
-        exercise_summary="Take one short deliberate break to protect vigilance, then return to the same task immediately.",
-        next_action="Take one 60-second break away from the screen, then return to the same task without switching topics.",
+        exercise_summary="Use one short break to protect vigilance, not to escape the task.",
+        next_action="Take one 60-second break away from the screen, then come straight back to the same problem or page.",
     ),
     "brief_reset_then_resume": PomodoroPracticeProtocol(
         practice_id="brief_reset_then_resume",
@@ -228,8 +249,8 @@ POMODORO_PRACTICE_PROTOCOLS = {
         rationale_key="brief_reset_then_resume",
         evidence_ids=("wolfe_2023", "smith_2016"),
         duration_seconds=90,
-        exercise_summary="Lower the stress load first, then resume with a simpler scaffold instead of pushing through overload.",
-        next_action="Take a 60-90 second reset, optionally using the mindfulness reset, then resume with one worked example or error-review step.",
+        exercise_summary="Lower the stress load first. Overload is a bad time to force speed or brute effort.",
+        next_action="Take a 60-90 second reset, optionally using mindfulness, then resume with one worked example or one error-review step.",
     ),
     "stay_the_course": PomodoroPracticeProtocol(
         practice_id="stay_the_course",
@@ -239,8 +260,8 @@ POMODORO_PRACTICE_PROTOCOLS = {
         rationale_key="stay_the_course",
         evidence_ids=("nickl_baeuml_2023", "renkl_1998"),
         duration_seconds=180,
-        exercise_summary="Keep the current task active with retrieval or self-explanation instead of changing tasks too early.",
-        next_action="Stay on the current task and keep the challenge active with a quick retrieval question or self-explanation pass instead of switching away.",
+        exercise_summary="The current lane is working. Keep effort active instead of switching too early.",
+        next_action="Stay on this task. Add one retrieval question or one self-explanation pass so attention stays active.",
     ),
 }
 
@@ -252,13 +273,13 @@ MINDFULNESS_PRACTICE_PROTOCOLS = {
         practice_family="focused_breath_counting",
         technique="focused attention + breath counting",
         rationale_key="focused_breath_counting",
-        evidence_ids=("levinson_2014", "ford_nagamatsu_2024", "ainsworth_2013"),
+        evidence_ids=("levinson_2014", "ford_nagamatsu_2024", "ainsworth_2013", "confusion_face_2015"),
         segment_steps=(
-            "Sit upright and count each exhale from 1 to 5, then restart at 1.",
-            "Keep the count exact; when the mind wanders, restart gently at 1.",
-            "Let the inhale arrive naturally and place the count only on each exhale.",
-            "Relax any urge to solve the task and complete only the next clean count cycle.",
-            "Drop the count, feel one full breath, and return to work with one concrete next step.",
+            "Sit upright. Count each exhale from 1 to 5. Then go back to 1.",
+            "Lose the count? Restart at 1 immediately, without analysis.",
+            "Let the inhale happen on its own. Put the number only on the exhale.",
+            "Do not solve anything right now. Just complete the next clean count cycle.",
+            "Drop the count, feel one full breath, and return with one concrete next step.",
         ),
     ),
     "alert_breath_anchor": PracticeProtocol(
@@ -267,13 +288,13 @@ MINDFULNESS_PRACTICE_PROTOCOLS = {
         practice_family="alert_breath_anchor",
         technique="alert breath anchor",
         rationale_key="alert_breath_anchor",
-        evidence_ids=("levinson_2014", "ford_nagamatsu_2024"),
+        evidence_ids=("levinson_2014", "ford_nagamatsu_2024", "dmello_body_2008"),
         segment_steps=(
-            "Sit taller, open the eyes, and feel feet and hands clearly.",
-            "Count the next 5 exhalations while tracking contact with the chair.",
-            "On each drift, say 'back' silently and return to the next exhale.",
-            "Keep the breath slightly more vivid than thoughts or nearby screens.",
-            "Choose one tiny target and re-enter work before attention dulls again.",
+            "Eyes open. Spine up. Feel the feet and hands clearly.",
+            "Count the next 5 exhalations while you stay aware of the chair contact.",
+            "Each time you drift, say 'back' once and return to the next exhale.",
+            "Keep the breath slightly brighter than thoughts or screens.",
+            "Pick one tiny target and return before attention goes flat again.",
         ),
     ),
     "curiosity_noting": PracticeProtocol(
@@ -282,13 +303,13 @@ MINDFULNESS_PRACTICE_PROTOCOLS = {
         practice_family="curiosity_noting",
         technique="curiosity noting",
         rationale_key="curiosity_noting",
-        evidence_ids=("yakobi_2021", "rahl_2017"),
+        evidence_ids=("yakobi_2021", "rahl_2017", "eastwood_2012", "dmello_body_2008"),
         segment_steps=(
-            "Name three changing sensations right now: sound, temperature, and contact.",
-            "Notice one subtle shift each breath: volume, pressure, movement, or light.",
-            "Let curiosity lead and ask what is changing in the hands, face, or chest.",
-            "Keep labeling softly with simple words like warm, tight, buzzing, or fading.",
-            "Carry one question of curiosity back to the task and start with the next concrete step.",
+            "Name three changing sensations now: sound, temperature, and contact.",
+            "Track one subtle shift on each breath: pressure, movement, light, or volume.",
+            "Ask what is changing in the hands, face, chest, or jaw.",
+            "Label it simply: warm, tight, buzzing, heavy, moving, fading.",
+            "Carry that curiosity back to work and start with the next concrete step.",
         ),
     ),
     "acceptance_body_release": PracticeProtocol(
@@ -299,11 +320,11 @@ MINDFULNESS_PRACTICE_PROTOCOLS = {
         rationale_key="acceptance_body_release",
         evidence_ids=("kober_2020", "wenzel_2021", "roll_2020"),
         segment_steps=(
-            "Feel the chair, feet, and hands, and let the jaw unclench.",
-            "Allow the feeling to be present without fixing it and lengthen the exhale slightly.",
-            "Sweep the body slowly: forehead, jaw, shoulders, chest, and hands.",
-            "On each exhale, soften one area that is gripping or bracing.",
-            "Return gently with one doable next step and less force.",
+            "Feel the chair, feet, and hands. Unclench the jaw.",
+            "Let the feeling be here without fixing it. Lengthen the exhale a little.",
+            "Sweep slowly through forehead, jaw, shoulders, chest, and hands.",
+            "On each exhale, soften one place that is gripping or bracing.",
+            "Return with one doable next step and less force.",
         ),
     ),
     "open_monitoring": PracticeProtocol(
@@ -314,10 +335,10 @@ MINDFULNESS_PRACTICE_PROTOCOLS = {
         rationale_key="open_monitoring",
         evidence_ids=("ainsworth_2013",),
         segment_steps=(
-            "Let attention open to sounds, light, breath, and body sensation together.",
-            "Notice experience arriving and changing without choosing a single object.",
-            "When a thought pulls you in, note it lightly and widen back out.",
-            "Stay with the full field of sensations, thoughts, and sounds as they pass.",
+            "Open attention to sounds, breath, light, and body sensation together.",
+            "Let experience arrive and change without picking one object to control.",
+            "When a thought grabs you, note it lightly and widen again.",
+            "Stay with the full field as sensations, thoughts, and sounds pass.",
             "Return to work with a calm, curious intention.",
         ),
     ),
@@ -329,11 +350,11 @@ MINDFULNESS_PRACTICE_PROTOCOLS = {
         rationale_key="loving_kindness_transition",
         evidence_ids=("fredrickson_2008",),
         segment_steps=(
-            "Place a hand lightly on the chest or desk and soften the face.",
+            "Place a hand on the chest or desk and soften the face.",
             "On each exhale, repeat: may I meet this moment with kindness.",
-            "Let the breath stay ordinary while the phrase stays gentle and steady.",
-            "Widen the wish: may I work with clarity and patience.",
-            "Carry that kinder tone into the next task step.",
+            "Keep the breath ordinary. Keep the phrase gentle and steady.",
+            "Widen it slightly: may I work with clarity and patience.",
+            "Carry that tone into the next task step.",
         ),
     ),
 }
@@ -439,10 +460,24 @@ def mindfulness_steering_key_for_profile(profile: AffectProfile) -> str:
 def _fallback_learning_cue() -> GuidanceCue:
     return GuidanceCue(
         title="Reset and restart",
-        body="Ground first, then restart with one small retrieval target or self-explanation step.",
+        body="Reset first. Then do one small retrieval target or one self-explanation step.",
         technique="mixed reset",
         rationale_key="fallback_mixed",
     )
+
+
+def _live_signal_phrase(kind: str) -> str:
+    if kind == "frustration":
+        return "Live face/body cues suggest overload and rising tension."
+    if kind == "confusion":
+        return "Live face cues suggest effortful confusion, not simple drift."
+    if kind == "boredom":
+        return "Live posture/body cues suggest underload or restless boredom."
+    if kind == "low_engagement":
+        return "Live face/body cues suggest drift and low alertness."
+    if kind == "steady":
+        return "Live cues look steady, regulated, and ready for sustained effort."
+    return "Live cues are mixed but not severe."
 
 
 def pomodoro_selection_from_practice_id(
@@ -503,7 +538,7 @@ def _base_pomodoro_selection(
     ):
         return pomodoro_selection_from_practice_id(
             "error_review_with_adaptable_feedback",
-            why_selected="Confusion stayed elevated across blocks, so move from struggle into error review with adaptable feedback.",
+            why_selected="Confusion stayed high across recent check-ins. Stop grinding and rebuild the rule from the last error with one targeted hint.",
             stability_label="Escalated",
             stability_reason="Escalated from unresolved confusion across recent self-checks.",
         )
@@ -511,7 +546,7 @@ def _base_pomodoro_selection(
     if not _has_live_profile(profile):
         return pomodoro_selection_from_practice_id(
             "retrieval_sprint",
-            why_selected="Live boredom, confusion, and frustration data are unavailable, so default to a short retrieval sprint instead of passive review.",
+            why_selected="Live face/body affect data are unavailable. Use retrieval instead of passive review to keep the task active.",
             stability_label="Fallback",
             stability_reason="Fallback recommendation while richer live affect is unavailable.",
         )
@@ -523,7 +558,7 @@ def _base_pomodoro_selection(
     ):
         return pomodoro_selection_from_practice_id(
             "brief_reset_then_resume",
-            why_selected="Frustration is elevated, so de-escalate first and re-enter with a scaffold instead of forcing speed.",
+            why_selected=f"{_live_signal_phrase('frustration')} Reset first, then re-enter with a scaffold instead of forcing speed.",
             stability_label="Reset first",
             stability_reason="Immediate override for frustration and overload.",
         )
@@ -535,7 +570,7 @@ def _base_pomodoro_selection(
     ):
         return pomodoro_selection_from_practice_id(
             "productive_struggle_then_hint",
-            why_selected="Confusion is high but engagement is still strong, so give productive struggle a short window before taking a hint.",
+            why_selected=f"{_live_signal_phrase('confusion')} Effort is still up, so try one short productive struggle window before taking a hint.",
             stability_label="Productive stretch",
             stability_reason="Good fit for productive confusion when engagement is still supporting effort.",
         )
@@ -543,7 +578,7 @@ def _base_pomodoro_selection(
     if _at_least(profile.confusion_label, "High"):
         return pomodoro_selection_from_practice_id(
             "worked_example_self_explain",
-            why_selected="Confusion is high without enough stable engagement, so narrow the task with a worked example and self-explanation.",
+            why_selected=f"{_live_signal_phrase('confusion')} Narrow the task now with one worked example and self-explanation.",
             stability_label="Scaffolded",
             stability_reason="Shifted toward scaffolded learning to resolve confusion.",
         )
@@ -551,7 +586,7 @@ def _base_pomodoro_selection(
     if _at_least(profile.boredom_label, "High") and _at_least(profile.engagement_label, "Medium") and _at_most(profile.confusion_label, "Low"):
         return pomodoro_selection_from_practice_id(
             "retrieval_sprint",
-            why_selected="Boredom is high while engagement is still available, so raise challenge with active retrieval instead of switching tasks.",
+            why_selected=f"{_live_signal_phrase('boredom')} Raise challenge with active retrieval instead of switching tasks.",
             stability_label="Challenge raised",
             stability_reason="Challenge is being raised to counter underload without changing topics.",
         )
@@ -559,7 +594,7 @@ def _base_pomodoro_selection(
     if _at_least(profile.boredom_label, "High") and _at_most(profile.engagement_label, "Low"):
         return pomodoro_selection_from_practice_id(
             "implementation_restart",
-            why_selected="Boredom is high and engagement has dropped, so restart attention with an explicit cue before asking for more effort.",
+            why_selected=f"{_live_signal_phrase('boredom')} Engagement is dropping, so restart attention with one explicit cue before asking for more effort.",
             stability_label="Restarting",
             stability_reason="Restart first because boredom and disengagement are paired.",
         )
@@ -567,7 +602,7 @@ def _base_pomodoro_selection(
     if _at_most(profile.engagement_label, "Low") and secondary_peak <= DISPLAY_LEVEL_VALUES["Medium"]:
         return pomodoro_selection_from_practice_id(
             "retrieval_sprint",
-            why_selected="Engagement is low without strong confusion or frustration, so use a short retrieval sprint to force active recall.",
+            why_selected=f"{_live_signal_phrase('low_engagement')} Use a short retrieval sprint to wake recall up.",
             stability_label="Re-engaging",
             stability_reason="Low-engagement fallback favors active recall over passive review.",
         )
@@ -580,14 +615,14 @@ def _base_pomodoro_selection(
     ):
         return pomodoro_selection_from_practice_id(
             "stay_the_course",
-            why_selected="Engagement is high and the other signals are quiet, so keep the current task and maintain active generation.",
+            why_selected=f"{_live_signal_phrase('steady')} Keep the current task and maintain active generation.",
             stability_label="Stable",
             stability_reason="Stable high-focus state.",
         )
 
     return pomodoro_selection_from_practice_id(
         "stay_the_course",
-        why_selected="The affect pattern is mixed but not severe, so stay on the current task with light retrieval or self-explanation.",
+        why_selected=f"{_live_signal_phrase('mixed')} Stay on the current task with light retrieval or self-explanation.",
         stability_label="Monitoring",
         stability_reason="No strong reason to switch practices yet.",
     )
@@ -647,7 +682,7 @@ def select_pomodoro_practice(
     ):
         return pomodoro_selection_from_practice_id(
             "brief_rare_break",
-            why_selected="Focus has stayed strong for most of the block, so one rare brief break can protect vigilance without turning into task switching.",
+            why_selected="Focus has stayed strong for most of the block. Use one rare brief break to protect vigilance, then come straight back.",
             stability_label="Rare break",
             stability_reason="Stable focus has held long enough to justify one rare short break.",
         )
@@ -767,7 +802,7 @@ def _selection_for_live_profile(profile: AffectProfile, *, elapsed_seconds: floa
         return mindfulness_selection_from_practice_id(
             "focused_breath_counting",
             elapsed_seconds=elapsed_seconds,
-            why_selected="No live affect is available, so start with a simple breath-counting anchor that supports steady attention.",
+            why_selected="No live face/body affect is available. Start with a simple breath count to steady attention fast.",
             steering_source="fallback",
         )
 
@@ -775,7 +810,7 @@ def _selection_for_live_profile(profile: AffectProfile, *, elapsed_seconds: floa
         return mindfulness_selection_from_practice_id(
             "acceptance_body_release",
             elapsed_seconds=elapsed_seconds,
-            why_selected="Frustration is elevated, so acceptance and body release can lower affective load before re-engaging.",
+            why_selected=f"{_live_signal_phrase('frustration')} Use acceptance and body release before asking for more control.",
             steering_source="live",
         )
 
@@ -783,7 +818,7 @@ def _selection_for_live_profile(profile: AffectProfile, *, elapsed_seconds: floa
         return mindfulness_selection_from_practice_id(
             "focused_breath_counting",
             elapsed_seconds=elapsed_seconds,
-            why_selected="Confusion is elevated, so a narrow counted anchor can reduce control demands and stabilize attention.",
+            why_selected=f"{_live_signal_phrase('confusion')} Narrow the field with a counted anchor.",
             steering_source="live",
         )
 
@@ -791,7 +826,7 @@ def _selection_for_live_profile(profile: AffectProfile, *, elapsed_seconds: floa
         return mindfulness_selection_from_practice_id(
             "curiosity_noting",
             elapsed_seconds=elapsed_seconds,
-            why_selected="Boredom is elevated, so active sensory noting adds novelty and pulls attention back into the present.",
+            why_selected=f"{_live_signal_phrase('boredom')} Use active sensory noting to add novelty and re-engage attention.",
             steering_source="live",
         )
 
@@ -799,14 +834,14 @@ def _selection_for_live_profile(profile: AffectProfile, *, elapsed_seconds: floa
         return mindfulness_selection_from_practice_id(
             "alert_breath_anchor",
             elapsed_seconds=elapsed_seconds,
-            why_selected="Engagement is low, so an alert breath anchor can brighten posture and reduce drift.",
+            why_selected=f"{_live_signal_phrase('low_engagement')} Use an alert breath anchor to brighten posture and reduce drift.",
             steering_source="live",
         )
 
     return mindfulness_selection_from_practice_id(
         "open_monitoring",
         elapsed_seconds=elapsed_seconds,
-        why_selected="Engagement is steady and secondary signals are quiet, so open monitoring fits a settled state.",
+        why_selected=f"{_live_signal_phrase('steady')} Open monitoring fits this settled state.",
         steering_source="live",
     )
 
@@ -822,7 +857,7 @@ def _selection_for_steering_key(
         return mindfulness_selection_from_practice_id(
             "loving_kindness_transition",
             elapsed_seconds=elapsed_seconds,
-            why_selected="Negative affect has repeated across steer-ins, so a brief kindness transition can reduce reactivity before the next task step.",
+            why_selected="Negative affect repeated across steer-ins. Use a brief kindness transition to lower reactivity before the next task step.",
             steering_source="checkin",
         )
 
@@ -830,7 +865,7 @@ def _selection_for_steering_key(
         return mindfulness_selection_from_practice_id(
             "acceptance_body_release",
             elapsed_seconds=elapsed_seconds,
-            why_selected="You reported feeling overwhelmed, so acceptance and body release are prioritized for the next segment.",
+            why_selected="You reported overwhelm. Soften body tension first, then re-enter with less force.",
             steering_source="checkin",
         )
 
@@ -838,7 +873,7 @@ def _selection_for_steering_key(
         return mindfulness_selection_from_practice_id(
             "focused_breath_counting",
             elapsed_seconds=elapsed_seconds,
-            why_selected="You reported confusion, so the next segment narrows attention to a countable breath anchor.",
+            why_selected="You reported confusion. Narrow attention to a countable breath anchor now.",
             steering_source="checkin",
         )
 
@@ -846,7 +881,7 @@ def _selection_for_steering_key(
         return mindfulness_selection_from_practice_id(
             "curiosity_noting",
             elapsed_seconds=elapsed_seconds,
-            why_selected="You reported restlessness, so the next segment uses active curiosity to restore engagement.",
+            why_selected="You reported restlessness. Use active curiosity to restore engagement without forcing stillness.",
             steering_source="checkin",
         )
 
@@ -854,14 +889,14 @@ def _selection_for_steering_key(
         return mindfulness_selection_from_practice_id(
             "alert_breath_anchor",
             elapsed_seconds=elapsed_seconds,
-            why_selected="You reported drifting, so the next segment brightens posture and returns to an alert breath anchor.",
+            why_selected="You reported drifting. Brighten posture and return to an alert breath anchor.",
             steering_source="checkin",
         )
 
     return mindfulness_selection_from_practice_id(
         "open_monitoring",
         elapsed_seconds=elapsed_seconds,
-        why_selected="You reported feeling settled, so the next segment keeps an open monitoring practice.",
+        why_selected="You reported feeling settled. Stay open and monitor experience without narrowing down.",
         steering_source="checkin",
     )
 
@@ -956,8 +991,8 @@ def pomodoro_timer_view(
             next_text = f"Practice: {selection.practice_label} ({selection.stability_label})"
             note_text = (
                 f"Why: {selection.why_selected} "
-                f"Exercise: {selection.exercise_summary} "
-                f"Next: {selection.next_action} "
+                f"Practice: {selection.exercise_summary} "
+                f"Do: {selection.next_action} "
             )
         return PomodoroTimerView(
             status="Focus Live",
@@ -1027,8 +1062,8 @@ def pomodoro_timer_view(
         next_text = f"Practice preview: {selection.practice_label}"
         note_text = (
             f"Why: {selection.why_selected} "
-            f"Exercise: {selection.exercise_summary} "
-            f"Next: {selection.next_action}"
+            f"Practice: {selection.exercise_summary} "
+            f"Do: {selection.next_action}"
         )
     return PomodoroTimerView(
         status="Idle",
@@ -1068,7 +1103,7 @@ def mindfulness_timer_view(
             time_text=format_clock(remaining_seconds),
             block_text=block_text,
             next_text=f"Practice: {selection.practice_label}",
-            note_text=f"Why: {selection.why_selected} Next: {selection.current_step}",
+            note_text=f"Why: {selection.why_selected} Do: {selection.current_step}",
             progress=progress,
         )
 
