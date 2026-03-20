@@ -2,6 +2,8 @@
 
 Complete DAiSEE engagement pipeline: HOG + XGBoost baseline, MobileNetV2 + LSTM/BiLSTM/TCN, single-task and multi-affect distillation, LMDB caching, and a desktop webcam app. Project is AI-assisted (ChatGPT/Codex).
 
+Cuda 12.8 specifically required for windows laptop for GPU offloading the training.
+
 ## Quick Start
 1. Create and activate a virtual environment (Python 3.11):
    ```powershell
